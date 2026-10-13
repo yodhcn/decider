@@ -21,7 +21,9 @@
 #
 # Run -- HTTP API, on llama.cpp.  Upstream's scripts/serve.sh starts decider.serve, which is the *torch* engine and
 # cannot read a GGUF ("The HTTP server does not serve GGUF files"), so this repo ships its own GGUF server.
-#   docker run --rm --gpus all -p 8000:8000 -v /srv/decider-4b-GGUF:/models -v decider-hf:/hf-cache \
+# A self-contained model folder is read in place and needs no cache volume -- nothing goes to the Hub.  The
+# /hf-cache volume is only for the other form, a Hub repo id (see README section 5).
+#   docker run --rm --gpus all -p 8000:8000 -v /srv/decider-4b-GGUF:/models \
 #     decider-gguf:cu12.4.1 scripts/serve.sh /models/decider-4b-v2.1-Q4_K_M.gguf 8000
 #
 # Run -- upstream's demo, or your own code (the model folder holds the .gguf, the tokenizer and decider_config.json)
@@ -158,7 +160,9 @@ LABEL org.opencontainers.image.title="decider-gguf" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 # libgomp1: llama.cpp's OpenMP runtime. The -runtime image carries no gcc, so nothing pulls it in by itself.
-# /hf-cache is the Hugging Face cache (HF_HOME), so a caller can mount a volume and reuse it.
+# /hf-cache is the Hugging Face cache (HF_HOME). A local model folder never writes it -- the Hub is only touched
+# when the model is passed as a repo id, which is the one case where mounting a volume here pays for itself.
+# Not a VOLUME on purpose: nothing should be downloaded into a layer that a caller forgets to persist.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \

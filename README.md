@@ -71,21 +71,38 @@ docker build -t decider-gguf:cu12.4.1 --build-arg DECIDER_REF=v1.9.0
 ### 1. 准备模型目录（镜像不含模型）
 
 `.gguf` 和它的 tokenizer、`decider_config.json` 必须放在同一个目录（上游 `Decider` 就是这么解析的）。
-两个官方 GGUF 仓库都带 Q4_K_M / Q8_0 / BF16 三个量化，所以**要显式指定文件名**：
 
 ```bash
 huggingface-cli download Mapika/decider-4b-GGUF --local-dir /srv/decider-4b-GGUF
-# /srv/decider-4b-GGUF/ 里应有 decider-4b-v2.1-Q4_K_M.gguf + tokenizer 文件 + decider_config.json
 ```
+
+下完该目录里应有这 5 类文件（两个官方 GGUF 仓库都是这个构成）：
+
+```
+decider-4b-v2.1-Q4_K_M.gguf   权重；另有 Q8_0 / BF16 两个量化（三个都下就 15 个文件）
+decider_config.json           temperature / layout / isolated_levels —— 见下面的警告
+tokenizer.json                tokenizer
+tokenizer_config.json
+chat_template.jinja           layout 为 chat 的 checkpoint 才用得到；本仓库的 4b-v2.1 是 plain
+```
+
+**缺 `decider_config.json` 不会报错，会静默换一套默认值**（上游 `Decider` 读它是 `try/except: pass`）。
+`decider-4b-v2.1` 的配置里带 `temperature: 1.099`、`temperature_by_type` 和 `isolated_levels: true` ——
+丢了它分数就不对，但服务照常起来。所以别只拷 `.gguf`。缺 tokenizer 文件则是**报错**，不用担心。
+
+三个量化都在同一个目录里时，**要显式指定文件名**（见下）。
 
 ### 2. HTTP API（llama.cpp）
 
 ```bash
 docker run --rm --gpus all -p 8000:8000 \
-  -v /srv/decider-4b-GGUF:/models -v decider-hf:/hf-cache \
+  -v /srv/decider-4b-GGUF:/models \
   decider-gguf:cu12.4.1 \
   scripts/serve.sh /models/decider-4b-v2.1-Q4_K_M.gguf 8000
 ```
+
+本地目录是自洽的（上面那 5 类文件齐了），所以**不需要挂 `/hf-cache`**：没有任何东西走 Hub 下载。
+想把它变成断言就加 `-e HF_HUB_OFFLINE=1`，能起来就证明确实没联网。缓存卷只有仓库 ID 那种用法才需要（见第 5 节）。
 
 `scripts/serve.sh [model] [port]`，`model` 可以是本地 `.gguf` 路径、装着 `.gguf` 的目录、或 HF 仓库 ID。
 默认监听 `0.0.0.0`（不是上游脚本的 `127.0.0.1` —— 容器里的 `127.0.0.1` 穿不过 published port）。
@@ -176,6 +193,8 @@ d.system_one(state, questions)
 
 ### 5. 不落盘模型：仓库 ID + 缓存卷
 
+**这是唯一需要 `/hf-cache` 的用法。** 本地目录（第 1、2 节）不碰 Hub，缓存卷是多余的。
+
 仓库 ID 直接交给 `Decider`（它自己去 Hub 拉 `.gguf`、tokenizer 和 `decider_config.json`）：
 
 ```bash
@@ -186,7 +205,8 @@ docker run --rm --gpus all -p 8000:8000 -v decider-hf:/hf-cache \
 
 （`-e` 和 `-v` 必须写在镜像名**之前**；写在后面会被当成 `scripts/serve.sh` 的参数。）
 
-首次联网写入 `/hf-cache`（= 镜像里的 `HF_HOME`），之后可加 `-e HF_HUB_OFFLINE=1` 离线跑。
+首次联网写入 `/hf-cache`（= 镜像里的 `HF_HOME`）。**不挂卷它不会失败**，只是缓存落在容器可写层里，
+`--rm` 一来就没了 —— 下次启动重新下载那个 2–3 GB 的量化。之后可加 `-e HF_HUB_OFFLINE=1` 离线跑。
 仓库里存着多个量化时，`DECIDER_GGUF_FILE` 是**必需**的；本服务不会替你猜（挑错量化 = 换了个模型）。
 本地目录里只有一个 `.gguf` 时可以省略。
 
