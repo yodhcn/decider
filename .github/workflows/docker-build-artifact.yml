@@ -18,7 +18,7 @@ on:
         required: false
         default: "86"
       torch_index:
-        description: "PyTorch index: the CPU wheel index (default), or https://pypi.org/simple for the CUDA torch build"
+        description: "PyTorch index: the CPU wheel index (default), or https://download.pytorch.org/whl/cu124 for a CUDA torch build. The driver caps CUDA at 12.4 and cp312 tops out at torch 2.6.0; nothing here needs CUDA torch."
         required: false
         default: "https://download.pytorch.org/whl/cpu"
 
@@ -104,13 +104,16 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # The import probe is not fatal: it must not stop a built image from reaching the artifact.
+      # The import probes are not fatal: they must not stop a built image from reaching the artifact.
       - name: Smoke test
         run: |
           set -euo pipefail
           docker image inspect --format 'image id={{.Id}} size={{.Size}} bytes' "$IMAGE_REF"
           docker run --rm "$IMAGE_REF" python -c "import glob,os,llama_cpp,torch;from decider.infer import Decider;lib=os.path.join(os.path.dirname(llama_cpp.__file__),'lib');print('torch',torch.__version__);print('cuda backend',[os.path.basename(p) for p in sorted(glob.glob(os.path.join(lib,'*cuda*')))])" \
             || echo "smoke test failed (not fatal)"
+          # The GGUF HTTP server this repo adds: the image asserts this at build time already, this is the record.
+          docker run --rm "$IMAGE_REF" python -c "import sys;sys.path.insert(0,'/app/scripts');import serve_gguf,fastapi,uvicorn;print('serve routes',sorted(r.path for r in serve_gguf.app.routes));print('fastapi',fastapi.__version__,'uvicorn',uvicorn.__version__)" \
+            || echo "serve probe failed (not fatal)"
 
       - name: Save image and checksum
         run: |
@@ -142,7 +145,7 @@ jobs:
             echo "built_at:         $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "run:              ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo "--- runtime ---"
-            docker run --rm "$IMAGE_REF" python -c "import importlib.metadata as m,sys;print('python', sys.version.split()[0]);print('decider-ai', m.version('decider-ai'));print('llama-cpp-python', m.version('llama-cpp-python'));print('torch', m.version('torch'))" \
+            docker run --rm "$IMAGE_REF" python -c "import importlib.metadata as m,sys;print('python='+sys.version.split()[0]);print('\n'.join(p+'='+m.version(p) for p in ('decider-ai','llama-cpp-python','torch','transformers','flash-linear-attention','fastapi','uvicorn')))" \
               || echo "runtime probe failed (not fatal)"
           } | tee "${ARTIFACT_NAME}.manifest.txt"
 
@@ -172,11 +175,19 @@ jobs:
             echo "| upstream | \`https://github.com/Mapika/decider @ ${UPSTREAM_REF}\` |"
             echo "| base | \`nvidia/cuda:12.4.1-runtime-ubuntu22.04\` |"
             echo ""
-            echo "Load on the host:"
+            echo "Load on the host, then either of:"
             echo ""
             echo '```bash'
             echo "gzip -dc ${ARTIFACT_NAME}.tar.gz | docker load"
             echo "docker run --rm --gpus all -v /srv/decider-4b-GGUF:/models ${IMAGE_REF} \\"
             echo "  python -m decider.infer /models/decider-4b-v2.1-Q4_K_M.gguf"
+            echo '```'
+            echo ""
+            echo "HTTP API on llama.cpp (scripts/serve.sh ships in the image; upstream's serve.sh is the torch engine and cannot read a GGUF):"
+            echo ""
+            echo '```bash'
+            echo "docker run --rm --gpus all -p 8000:8000 -v /srv/decider-4b-GGUF:/models ${IMAGE_REF} \\"
+            echo "  scripts/serve.sh /models/decider-4b-v2.1-Q4_K_M.gguf 8000"
+            echo "curl -s localhost:8000/health"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
