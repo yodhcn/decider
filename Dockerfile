@@ -126,7 +126,8 @@ RUN /opt/venv/bin/python -c "import importlib.metadata as m;print(' '.join(p+'='
 # libcuda.so.1 satisfies the loader without a GPU: importing resolves the driver's entry points and calls none of
 # them. The alias is made under /tmp in the builder, and the builder is copied nowhere.
 RUN set -eux; \
-    lib=/opt/venv/lib/python3.12/site-packages/llama_cpp/lib; \
+    lib="$(/opt/venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/llama_cpp/lib"; \
+    test -d "$lib" || { echo "not a directory: $lib (venv copy or PYTHON_VERSION changed?)" >&2; exit 1; }; \
     ls -l "$lib"; \
     ls "$lib"/libggml-cuda.so*; \
     readelf -d "$lib"/*.so* 2>/dev/null | grep -F '[libcuda.so.1]'; \
@@ -192,10 +193,11 @@ WORKDIR /app
 #   * the GGUF HTTP server this repo adds imports with all five routes -- catches a serve extra that did not land
 #     or a route upstream renamed. The import is cheap: the model is only loaded in the FastAPI lifespan.
 RUN set -eux; \
-    lib=/opt/venv/lib/python3.12/site-packages/llama_cpp/lib; \
+    lib="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/llama_cpp/lib"; \
+    test -d "$lib" || { echo "not a directory: $lib (venv copy or PYTHON_VERSION changed?)" >&2; exit 1; }; \
     ls -l "$lib"; \
     ls "$lib"/libggml-cuda.so*; \
-    python -c "import glob, subprocess as sp; lib='/opt/venv/lib/python3.12/site-packages/llama_cpp/lib'; libs=sorted(glob.glob(lib+'/*.so*')); assert libs, 'no shared libraries under '+lib; out=sp.run(['ldd']+libs, capture_output=True, text=True).stdout; missing=sorted({l.split()[0] for l in out.splitlines() if 'not found' in l}); print('unresolved shared libraries:', missing); driver=('libcuda.so.1','libnvcuvid.so.1'); bad=[m for m in missing if not (m in driver or m.startswith('libnvidia'))]; assert not bad, 'this image cannot resolve: '+repr(bad)"; \
+    python -c "import glob, subprocess as sp, sysconfig; lib=sysconfig.get_paths()['purelib']+'/llama_cpp/lib'; libs=sorted(glob.glob(lib+'/*.so*')); assert libs, 'no shared libraries under '+lib; out=sp.run(['ldd']+libs, capture_output=True, text=True).stdout; missing=sorted({l.split()[0] for l in out.splitlines() if 'not found' in l}); print('unresolved shared libraries:', missing); driver=('libcuda.so.1','libnvcuvid.so.1'); bad=[m for m in missing if not (m in driver or m.startswith('libnvidia'))]; assert not bad, 'this image cannot resolve: '+repr(bad)"; \
     chmod +x /app/scripts/serve.sh; \
     bash -n /app/scripts/serve.sh; \
     python -c "import sys; sys.path.insert(0, '/app/scripts'); import serve_gguf; paths=sorted(r.path for r in serve_gguf.app.routes); missing={'/decide','/v1/systemone','/health','/v1/models','/stats'}-set(paths); assert not missing, 'missing routes: '+repr(missing); print('serve routes', paths)"

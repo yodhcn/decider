@@ -106,14 +106,18 @@ jobs:
 
       # The runner has no GPU, and this image deliberately does not carry libcuda.so.1 -- the host driver injects
       # it at run time -- so nothing can be *loaded* here. The build already does that, against the driver stub
-      # that the -devel image ships. What this checks is the image that was actually saved on the runner: that the
-      # CUDA backend and the GGUF HTTP server survived into it. Both checks are fatal: an image without them is
-      # worse than no artifact, because llama.cpp drops to the CPU in silence.
+      # that the -devel image ships. What this checks is the image buildx just loaded on the runner, the one the
+      # next step saves: that the CUDA backend and the GGUF HTTP server survived into it. Both checks are fatal: an
+      # image without them is worse than no artifact, because llama.cpp drops to the CPU in silence.
       - name: Smoke test
         run: |
           set -euo pipefail
           docker image inspect --format 'image id={{.Id}} size={{.Size}} bytes' "$IMAGE_REF"
-          docker run --rm "$IMAGE_REF" sh -c 'lib=/opt/venv/lib/python3*/site-packages/llama_cpp/lib; ls -l "$lib"; ls "$lib"/libggml-cuda.so*'
+          # Why not `sh -c 'lib=/opt/venv/lib/python3*/...; ls "$lib"'`: an assignment does not glob, and a wildcard
+          # that arrives through a quoted "$lib" is literal to the shell -- so the pattern never matched and the
+          # check failed with it unexpanded. Python's glob has no such trap, and it is what the runtime stage asserts
+          # with, so both find the directory the same way.
+          docker run --rm "$IMAGE_REF" python -c "import glob,os,sys;hits=sorted(glob.glob('/opt/venv/lib/python3*/site-packages/llama_cpp/lib/libggml-cuda.so*'));print('llama_cpp cuda libs:',[os.path.basename(h) for h in hits]);sys.exit(0 if hits else 'no CUDA backend in the saved image: llama.cpp would fall back to the CPU in silence')"
           docker run --rm "$IMAGE_REF" python -c "import sys;sys.path.insert(0,'/app/scripts');import serve_gguf,fastapi,uvicorn;print('serve routes',sorted(r.path for r in serve_gguf.app.routes));print('fastapi',fastapi.__version__,'uvicorn',uvicorn.__version__)"
 
       - name: Save image and checksum
