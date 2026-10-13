@@ -1,0 +1,182 @@
+name: docker-build-artifact
+
+# Builds the CUDA 12.4.1 / llama.cpp GGUF image and uploads it as a workflow artifact
+# (`docker save | gzip`). Nothing is pushed to a registry: download the artifact from the run page and
+# `docker load < decider-gguf-*.tar.gz` (or `gzip -dc ... | docker load`).
+#
+# Manual only -- a multi-GB artifact does not belong on every push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Mapika/decider git ref: branch, tag or commit SHA"
+        required: false
+        default: "main"
+      llama_cuda_arch:
+        description: "CUDA arch of the llama.cpp build (86 = A40 / Ampere; native, all or 80;86 also work)"
+        required: false
+        default: "86"
+      torch_index:
+        description: "PyTorch index: the CPU wheel index (default), or https://pypi.org/simple for the CUDA torch build"
+        required: false
+        default: "https://download.pytorch.org/whl/cpu"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # The build needs roughly 15 GB (the -devel CUDA layer, the venv, the saved tar); a hosted runner has ~14 GB.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          large-packages: true
+          swap-storage: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Inputs are validated here and published both as step outputs (for `with:`) and as environment variables
+      # (for the shell steps), so no workflow input is ever interpolated into a `run:` script.
+      - name: Image metadata
+        id: meta
+        env:
+          IN_UPSTREAM_REF: ${{ inputs.upstream_ref }}
+          IN_LLAMA_CUDA_ARCH: ${{ inputs.llama_cuda_arch }}
+          IN_TORCH_INDEX: ${{ inputs.torch_index }}
+        run: |
+          set -euo pipefail
+          ref="${IN_UPSTREAM_REF:-main}"
+          arch="${IN_LLAMA_CUDA_ARCH:-86}"
+          torch_index="${IN_TORCH_INDEX:-https://download.pytorch.org/whl/cpu}"
+          # An input is refused rather than escaped: none of the three can contain a space, a quote or a newline.
+          printf '%s' "$ref" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]*$' \
+            || { echo "refusing upstream_ref '$ref'" >&2; exit 1; }
+          printf '%s' "$arch" | grep -Eq '^(native|all|[0-9]+(;[0-9]+)*)$' \
+            || { echo "refusing llama_cuda_arch '$arch'" >&2; exit 1; }
+          printf '%s' "$torch_index" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9:/.+_-]*$' \
+            || { echo "refusing torch_index '$torch_index'" >&2; exit 1; }
+          # A docker tag only takes [A-Za-z0-9._-], so `80;86` has to reach the tag as `80-86`. The tag is also
+          # capped: a tag is 128 characters at most and a ref can be longer.
+          slug="$(printf '%s' "$ref" | tr -cs 'A-Za-z0-9._-' '-' | cut -c1-40 | sed 's/^-*//; s/-*$//')"
+          arch_tag="$(printf '%s' "$arch" | tr -c 'A-Za-z0-9._-' '-')"
+          [ -n "$slug" ] || slug=ref
+          image=decider-gguf
+          tag="cu12.4.1-${slug}-sm${arch_tag}"
+          name="${image}-${tag}-amd64"
+          {
+            echo "ref=$ref"
+            echo "arch=$arch"
+            echo "torch_index=$torch_index"
+            echo "image=$image"
+            echo "tag=$tag"
+            echo "name=$name"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "IMAGE_REF=$image:$tag"
+            echo "ARTIFACT_NAME=$name"
+            echo "UPSTREAM_REF=$ref"
+            echo "LLAMA_CUDA_ARCH=$arch"
+            echo "TORCH_INDEX=$torch_index"
+          } >> "$GITHUB_ENV"
+          echo "### decider-gguf : \`$image:$tag\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: false
+          # load: without it the image only lives in the buildx cache and `docker save` would have nothing to export.
+          load: true
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          build-args: |
+            DECIDER_REF=${{ steps.meta.outputs.ref }}
+            LLAMA_CUDA_ARCH=${{ steps.meta.outputs.arch }}
+            TORCH_INDEX=${{ steps.meta.outputs.torch_index }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The import probe is not fatal: it must not stop a built image from reaching the artifact.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          docker image inspect --format 'image id={{.Id}} size={{.Size}} bytes' "$IMAGE_REF"
+          docker run --rm "$IMAGE_REF" python -c "import glob,os,llama_cpp,torch;from decider.infer import Decider;lib=os.path.join(os.path.dirname(llama_cpp.__file__),'lib');print('torch',torch.__version__);print('cuda backend',[os.path.basename(p) for p in sorted(glob.glob(os.path.join(lib,'*cuda*')))])" \
+            || echo "smoke test failed (not fatal)"
+
+      - name: Save image and checksum
+        run: |
+          set -euo pipefail
+          if command -v pigz >/dev/null 2>&1; then comp=pigz; else comp=gzip; fi
+          echo "compressing with $comp"
+          docker save "$IMAGE_REF" | "$comp" > "${RUNNER_TEMP}/${ARTIFACT_NAME}.tar.gz"
+          cd "${RUNNER_TEMP}"
+          # Only the file name goes in the checksum file, so `sha256sum -c` works in the download directory.
+          sha256sum "${ARTIFACT_NAME}.tar.gz" > "${ARTIFACT_NAME}.tar.gz.sha256"
+          ls -lh "${ARTIFACT_NAME}.tar.gz" "${ARTIFACT_NAME}.tar.gz.sha256"
+
+      - name: Manifest
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          {
+            echo "image:            $IMAGE_REF"
+            echo "image_id:         $(docker image inspect --format '{{.Id}}' "$IMAGE_REF")"
+            echo "image_size_bytes: $(docker image inspect --format '{{.Size}}' "$IMAGE_REF")"
+            echo "platform:         linux/amd64"
+            echo "base:             nvidia/cuda:12.4.1-runtime-ubuntu22.04"
+            echo "upstream:         https://github.com/Mapika/decider @ ${UPSTREAM_REF}"
+            echo "llama_cuda_arch:  ${LLAMA_CUDA_ARCH}"
+            echo "torch_index:      ${TORCH_INDEX}"
+            echo "tar_gz:           ${ARTIFACT_NAME}.tar.gz"
+            echo "tar_gz_bytes:     $(stat -c %s "${ARTIFACT_NAME}.tar.gz")"
+            echo "tar_gz_sha256:    $(cut -d' ' -f1 "${ARTIFACT_NAME}.tar.gz.sha256")"
+            echo "built_at:         $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "run:              ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "--- runtime ---"
+            docker run --rm "$IMAGE_REF" python -c "import importlib.metadata as m,sys;print('python', sys.version.split()[0]);print('decider-ai', m.version('decider-ai'));print('llama-cpp-python', m.version('llama-cpp-python'));print('torch', m.version('torch'))" \
+              || echo "runtime probe failed (not fatal)"
+          } | tee "${ARTIFACT_NAME}.manifest.txt"
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: |
+            ${{ runner.temp }}/${{ steps.meta.outputs.name }}.tar.gz
+            ${{ runner.temp }}/${{ steps.meta.outputs.name }}.tar.gz.sha256
+            ${{ runner.temp }}/${{ steps.meta.outputs.name }}.manifest.txt
+          if-no-files-found: error
+          # The tar is already gzip-compressed; compressing it again only burns CPU and upload time.
+          compression-level: 0
+          retention-days: 30
+          # v4 refuses a duplicate name; without this a manual re-run of the same ref fails outright.
+          overwrite: true
+
+      - name: Summary
+        run: |
+          {
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| image | \`$IMAGE_REF\` |"
+            echo "| artifact | \`$ARTIFACT_NAME\` (tar.gz + .sha256 + .manifest.txt) |"
+            echo "| upstream | \`https://github.com/Mapika/decider @ ${UPSTREAM_REF}\` |"
+            echo "| base | \`nvidia/cuda:12.4.1-runtime-ubuntu22.04\` |"
+            echo ""
+            echo "Load on the host:"
+            echo ""
+            echo '```bash'
+            echo "gzip -dc ${ARTIFACT_NAME}.tar.gz | docker load"
+            echo "docker run --rm --gpus all -v /srv/decider-4b-GGUF:/models ${IMAGE_REF} \\"
+            echo "  python -m decider.infer /models/decider-4b-v2.1-Q4_K_M.gguf"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

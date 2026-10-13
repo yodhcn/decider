@@ -1,0 +1,6 @@
+# The upstream source is fetched inside the image, so the build context is the Dockerfile alone.
+
+**
+
+!Dockerfile
+!.dockerignore

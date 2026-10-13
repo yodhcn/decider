@@ -1,0 +1,7 @@
+# Local agent workspace metadata (memory, session state) — never committed.
+.workbuddy/
+
+# Artifacts downloaded from the `docker-build-artifact` workflow.
+*.tar.gz
+*.tar.gz.sha256
+*.manifest.txt
