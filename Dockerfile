@@ -114,9 +114,26 @@ RUN set -eux; \
 RUN /opt/venv/bin/python -c "import importlib.metadata as m;print(' '.join(p+'='+m.version(p) for p in ('decider-ai','torch','transformers','flash-linear-attention','llama-cpp-python','fastapi','uvicorn')))"
 
 # Self-check for what the install step alone cannot promise: that the CUDA backend really landed in the built
-# llama.cpp (a missing backend is a silent CPU fallback, not an install error) and that both serving paths import.
+# llama.cpp. A missing backend is a silent CPU fallback -- the install succeeds either way -- so it is asserted
+# here, again on the image that ships (the runtime stage) and again in the workflow smoke test.
+#
+# `import llama_cpp` cannot be run bare in a build. Built with GGML_CUDA, llama.cpp links the CUDA *driver*
+# (libcuda.so.1, for the VMM pool) and no CUDA image carries that library: the host driver injects it at run time,
+# through the NVIDIA container runtime. What the -devel image does carry is the driver *stub* (libcuda.so, 70 KB,
+# under /usr/local/cuda*/.../lib/stubs -- the directory its LIBRARY_PATH already points at). Aliasing that to
+# libcuda.so.1 satisfies the loader without a GPU: importing resolves the driver's entry points and calls none of
+# them. The alias is made under /tmp in the builder, and the builder is copied nowhere.
 RUN set -eux; \
-    /opt/venv/bin/python -c "import glob,os,llama_cpp,torch,fastapi,uvicorn;from decider.infer import Decider;from decider.engine_gguf import GGUFEngine;from decider.serve import app;lib=os.path.join(os.path.dirname(llama_cpp.__file__),'lib');cuda=sorted(glob.glob(os.path.join(lib,'*cuda*')));assert cuda,'llama.cpp was built without a CUDA backend: '+lib+' holds '+repr(sorted(os.listdir(lib)));print('OK torch='+torch.__version__+' fastapi='+fastapi.__version__+' uvicorn='+uvicorn.__version__+' cuda_backend='+repr([os.path.basename(p) for p in cuda]))"
+    lib=/opt/venv/lib/python3.12/site-packages/llama_cpp/lib; \
+    ls -l "$lib"; \
+    ls "$lib"/libggml-cuda.so*; \
+    readelf -d "$lib"/*.so* 2>/dev/null | grep -F '[libcuda.so.1]'; \
+    stub="$(ls /usr/local/cuda*/lib64/stubs/libcuda.so /usr/local/cuda*/targets/*/lib/stubs/libcuda.so 2>/dev/null | head -1)"; \
+    test -n "$stub"; \
+    mkdir -p /tmp/cuda-stub; \
+    ln -sf "$stub" /tmp/cuda-stub/libcuda.so.1; \
+    LD_LIBRARY_PATH=/tmp/cuda-stub /opt/venv/bin/python -c "import os, llama_cpp, torch, fastapi, uvicorn; from decider.infer import Decider; from decider.engine_gguf import GGUFEngine; from decider.serve import app; print('OK llama_cpp='+llama_cpp.__version__+' torch='+torch.__version__+' fastapi='+fastapi.__version__+' uvicorn='+uvicorn.__version__+' at '+os.path.dirname(llama_cpp.__file__))"; \
+    rm -rf /tmp/cuda-stub
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Stage 2: runtime. `-runtime` keeps cudart/cuBLAS (llama.cpp links them) and drops nvcc, the headers and the
@@ -161,11 +178,22 @@ COPY scripts /app/scripts
 
 WORKDIR /app
 
-# The GGUF HTTP server this repo adds on top of upstream (scripts/serve_gguf.py, wire-compatible with
-# decider.serve).  The import is cheap -- the model is only loaded in the FastAPI lifespan, not at import -- and
-# it is what catches a serve extra that did not land or a route that upstream renamed.
+# Three checks on the image that ships. None of them needs a GPU:
+#   * the CUDA backend is in the venv that was copied over -- llama.cpp falls back to the CPU in silence.
+#   * every shared library the llama.cpp libs need resolves *here*, and the CUDA driver is the only one that does
+#     not. The driver is meant to be missing (the host injects it at run time), so it is allowed by name -- and by
+#     exact name: `libcuda*` would also match libcudart.so.12, which must be there and is exactly the kind of
+#     thing this check is for. Anything else unresolved breaks the build. This is also why this stage cannot
+#     `import llama_cpp` either -- same driver, same reason as the builder stage above.
+#   * the GGUF HTTP server this repo adds imports with all five routes -- catches a serve extra that did not land
+#     or a route upstream renamed. The import is cheap: the model is only loaded in the FastAPI lifespan.
 RUN set -eux; \
+    lib=/opt/venv/lib/python3.12/site-packages/llama_cpp/lib; \
+    ls -l "$lib"; \
+    ls "$lib"/libggml-cuda.so*; \
+    python -c "import glob, subprocess as sp; lib='/opt/venv/lib/python3.12/site-packages/llama_cpp/lib'; libs=sorted(glob.glob(lib+'/*.so*')); assert libs, 'no shared libraries under '+lib; out=sp.run(['ldd']+libs, capture_output=True, text=True).stdout; missing=sorted({l.split()[0] for l in out.splitlines() if 'not found' in l}); print('unresolved shared libraries:', missing); driver=('libcuda.so.1','libnvcuvid.so.1'); bad=[m for m in missing if not (m in driver or m.startswith('libnvidia'))]; assert not bad, 'this image cannot resolve: '+repr(bad)"; \
     chmod +x /app/scripts/serve.sh; \
+    bash -n /app/scripts/serve.sh; \
     python -c "import sys; sys.path.insert(0, '/app/scripts'); import serve_gguf; paths=sorted(r.path for r in serve_gguf.app.routes); missing={'/decide','/v1/systemone','/health','/v1/models','/stats'}-set(paths); assert not missing, 'missing routes: '+repr(missing); print('serve routes', paths)"
 
 # Informational only (docker run -P would publish it); scripts/serve.sh defaults to 0.0.0.0:8000.

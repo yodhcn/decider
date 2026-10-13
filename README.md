@@ -271,18 +271,33 @@ docker build -t decider-gguf:cu12.4.1-cudatorch --build-arg TORCH_INDEX=https://
 ## 已知限制
 
 - **交付时本机没有 docker，也没有 GPU。** Dockerfile 与 workflow 只跑过静态校验；HTTP 服务是用一个
-  `decider.infer.Decider` 桩在本地真跑过一遍（24 项断言：路由、wire 格式、422/413/503、模型解析规则），
-  但**桩证明不了 llama.cpp 真实前向的任何数字**。下面这些都要靠第一次 CI 构建 / A40 上首次运行才算验过：
-  - 构建期断言 `*cuda*` 落在 `llama_cpp/lib/`：llama.cpp 缺 CUDA 后端时不会报错、只会静默走 CPU，所以专门断言。
-    失败会直接停在那行并打印该目录实际内容。
+  `decider.infer.Decider` 桩在本地真跑过一遍（29 项断言：路由、wire 格式、422/413/503、模型解析规则），
+  比第一次 CI 构建更早地兜住了本仓库自己写的那部分。**桩证明不了 llama.cpp 真实前向的任何数字**：
+  - **镜像里没有 `libcuda.so.1`**，而且不该有 —— 它是宿主机驱动经 NVIDIA container runtime 在**运行时**注入的，
+    任何 CUDA 基础镜像里都没有（`cuda-cudart-12-4` 只装 3 个文件，`cuda-driver-dev-12-4` 只装一个 stub）。
+    所以「wheel 到底能不能加载」在无 GPU 的构建机上本来无从验证；构建期改用 `-devel` 镜像自带的驱动
+    **stub**（`/usr/local/cuda*/.../lib/stubs/libcuda.so`，别名成 `libcuda.so.1`）满足加载器 —— 只解析符号、
+    不调用，因此不需要 GPU。这让 `import llama_cpp` 进了构建期断言，只在 `/tmp` 里做别名，不进交付镜像。
+  - 构建期断言 CUDA 后端：`llama_cpp/lib/libggml-cuda.so` 存在，且这批库里确有 `DT_NEEDED [libcuda.so.1]`
+    （llama.cpp 缺 CUDA 后端时不报错、只静默走 CPU，所以专门断言）。失败会停在那行并打印该目录实际内容。
+  - 运行时镜像断言动态依赖：`ldd` 出来的未解析项**只允许**是驱动库 —— 精确放行 `libcuda.so.1` /
+    `libnvcuvid.so.1` / `libnvidia*`（不能写成前缀 `libcuda*`：那会把 `libcudart.so.12` 一起放行，
+    而后者缺失恰恰是这项检查要抓的）。其余任何缺失都是这个镜像真的坏了。
   - 构建期断言 `serve_gguf` 能 import 且五条路由都在：catch `serve` extra 没装上、或上游改了路由名。
-  - `scripts/serve.sh` 只在 A40 上真跑一次才算验过。
-- 构建时间：llama.cpp 的 CUDA 编译 + torch 下载，2 核 runner 上大致 30–60 分钟（`timeout-minutes: 120`，
-  并先跑 `free-disk-space`，因为 -devel 层 + venv + tar 大约要 15 GB）。
+  - `scripts/serve.sh` 只在 A40 上真跑一次才算验过；`import llama_cpp` 在带驱动的机器上真加载也没验过：
+    ```bash
+    docker run --rm --gpus all decider-gguf:cu12.4.1 \
+      python -c "import llama_cpp, torch; print(llama_cpp.__version__, torch.__version__)"
+    ```
+- 构建时间：第一次 CI 实测 `pip install "/opt/decider[gguf,serve]"` 那一步 **725 s（12 分钟）**，其中
+  llama-cpp-python 的 wheel 编译 **703 s**；`timeout-minutes: 120` 富余很大。llama-cpp-python 的 CUDA wheel
+  **458 MB**（它把 cudart / cuBLAS 一起打进 `llama_cpp/lib/`），所以 `-devel` 层 + venv + tar 大约要 15 GB，
+  构建前先跑 `free-disk-space`。
 - artifact 单件上限 **10 GB（硬限制）**，所以镜像是先 `docker save | pigz` 再上传，`compression-level: 0`
   避免二次压缩。
 - 镜像以 root 运行；`/dev/nvidia*` 由 nvidia-container-toolkit 在容器启动前注入，不需要额外 `--privileged`。
-- 没有 GPU 的 runner 上跑不了真实推理，所以 CI 只做 import / CUDA 后端 / 版本探测（探测失败不阻断上传）。
+- 没有 GPU 的 runner 上跑不了真实推理：CI 核对的是**交付镜像本身** —— CUDA 后端在、动态依赖除驱动外全解析、
+  HTTP 服务五条路由齐（这三项都在构建期与 smoke test 里断言，失败即不出 artifact）。
 - HTTP 服务的并发是**串行**的：一个 worker、一个 llama.cpp context。想提高吞吐应该多开容器进程
   （各自一份 KV），而不是加 uvicorn worker —— 后者会让多个进程共用一份 context，正是这里刻意避免的。
 

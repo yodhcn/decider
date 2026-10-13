@@ -104,16 +104,17 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # The import probes are not fatal: they must not stop a built image from reaching the artifact.
+      # The runner has no GPU, and this image deliberately does not carry libcuda.so.1 -- the host driver injects
+      # it at run time -- so nothing can be *loaded* here. The build already does that, against the driver stub
+      # that the -devel image ships. What this checks is the image that was actually saved on the runner: that the
+      # CUDA backend and the GGUF HTTP server survived into it. Both checks are fatal: an image without them is
+      # worse than no artifact, because llama.cpp drops to the CPU in silence.
       - name: Smoke test
         run: |
           set -euo pipefail
           docker image inspect --format 'image id={{.Id}} size={{.Size}} bytes' "$IMAGE_REF"
-          docker run --rm "$IMAGE_REF" python -c "import glob,os,llama_cpp,torch;from decider.infer import Decider;lib=os.path.join(os.path.dirname(llama_cpp.__file__),'lib');print('torch',torch.__version__);print('cuda backend',[os.path.basename(p) for p in sorted(glob.glob(os.path.join(lib,'*cuda*')))])" \
-            || echo "smoke test failed (not fatal)"
-          # The GGUF HTTP server this repo adds: the image asserts this at build time already, this is the record.
-          docker run --rm "$IMAGE_REF" python -c "import sys;sys.path.insert(0,'/app/scripts');import serve_gguf,fastapi,uvicorn;print('serve routes',sorted(r.path for r in serve_gguf.app.routes));print('fastapi',fastapi.__version__,'uvicorn',uvicorn.__version__)" \
-            || echo "serve probe failed (not fatal)"
+          docker run --rm "$IMAGE_REF" sh -c 'lib=/opt/venv/lib/python3*/site-packages/llama_cpp/lib; ls -l "$lib"; ls "$lib"/libggml-cuda.so*'
+          docker run --rm "$IMAGE_REF" python -c "import sys;sys.path.insert(0,'/app/scripts');import serve_gguf,fastapi,uvicorn;print('serve routes',sorted(r.path for r in serve_gguf.app.routes));print('fastapi',fastapi.__version__,'uvicorn',uvicorn.__version__)"
 
       - name: Save image and checksum
         run: |
