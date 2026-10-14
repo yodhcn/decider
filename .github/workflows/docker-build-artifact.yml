@@ -1,8 +1,8 @@
 name: docker-build-artifact
 
-# Builds the CUDA 12.4.1 / llama.cpp GGUF image and uploads it as a workflow artifact
-# (`docker save | gzip`). Nothing is pushed to a registry: download the artifact from the run page and
-# `docker load < decider-gguf-*.tar.gz` (or `gzip -dc ... | docker load`).
+# Builds the CUDA 12.4.1 / torch image (decider.serve on decider.engine_v2.EngineV2) and uploads it as a
+# workflow artifact (`docker save | gzip`). Nothing is pushed to a registry: download the artifact from the run
+# page and `gzip -dc decider-torch-*.tar.gz | docker load`.
 #
 # Manual only -- a multi-GB artifact does not belong on every push.
 
@@ -13,14 +13,14 @@ on:
         description: "Mapika/decider git ref: branch, tag or commit SHA"
         required: false
         default: "main"
-      llama_cuda_arch:
-        description: "CUDA arch of the llama.cpp build (86 = A40 / Ampere; native, all or 80;86 also work)"
-        required: false
-        default: "86"
       torch_index:
-        description: "PyTorch index: the CPU wheel index (default), or https://download.pytorch.org/whl/cu124 for a CUDA torch build. The driver caps CUDA at 12.4 and cp312 tops out at torch 2.6.0; nothing here needs CUDA torch."
+        description: "PyTorch wheel index. cu124 is what the target driver allows (it caps CUDA at 12.4). The last path segment becomes part of the tag; pypi.org/simple would mean 'torch however PyPI ships it'."
         required: false
-        default: "https://download.pytorch.org/whl/cpu"
+        default: "https://download.pytorch.org/whl/cu124"
+      torch_spec:
+        description: "Requirement to install from that index. 'torch' takes the newest cu124 wheel for cp312 (2.6.0); pin with torch==2.6.0 for a reproducible build."
+        required: false
+        default: "torch"
 
 permissions:
   contents: read
@@ -28,11 +28,12 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
-      # The build needs roughly 15 GB (the -devel CUDA layer, the venv, the saved tar); a hosted runner has ~14 GB.
+      # torch's cu124 wheels carry their own CUDA user space (cudart, cuBLAS, cuDNN, NCCL, nvrtc) and a hosted
+      # runner has roughly 14 GB free, which the venv plus the saved tar will not fit in.
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
         with:
@@ -48,32 +49,36 @@ jobs:
         id: meta
         env:
           IN_UPSTREAM_REF: ${{ inputs.upstream_ref }}
-          IN_LLAMA_CUDA_ARCH: ${{ inputs.llama_cuda_arch }}
           IN_TORCH_INDEX: ${{ inputs.torch_index }}
+          IN_TORCH_SPEC: ${{ inputs.torch_spec }}
         run: |
           set -euo pipefail
           ref="${IN_UPSTREAM_REF:-main}"
-          arch="${IN_LLAMA_CUDA_ARCH:-86}"
-          torch_index="${IN_TORCH_INDEX:-https://download.pytorch.org/whl/cpu}"
+          torch_index="${IN_TORCH_INDEX:-https://download.pytorch.org/whl/cu124}"
+          torch_spec="${IN_TORCH_SPEC:-torch}"
           # An input is refused rather than escaped: none of the three can contain a space, a quote or a newline.
           printf '%s' "$ref" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]*$' \
             || { echo "refusing upstream_ref '$ref'" >&2; exit 1; }
-          printf '%s' "$arch" | grep -Eq '^(native|all|[0-9]+(;[0-9]+)*)$' \
-            || { echo "refusing llama_cuda_arch '$arch'" >&2; exit 1; }
           printf '%s' "$torch_index" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9:/.+_-]*$' \
             || { echo "refusing torch_index '$torch_index'" >&2; exit 1; }
-          # A docker tag only takes [A-Za-z0-9._-], so `80;86` has to reach the tag as `80-86`. The tag is also
-          # capped: a tag is 128 characters at most and a ref can be longer.
+          printf '%s' "$torch_spec" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._=<>!~+,*-]*$' \
+            || { echo "refusing torch_spec '$torch_spec'" >&2; exit 1; }
+          # The index's last path segment names the wheel flavour in the tag: .../whl/cu124 -> cu124, .../whl/cpu
+          # -> cpu. A docker tag only takes [A-Za-z0-9._-], so anything else is refused rather than mangled.
+          flavour="$(printf '%s' "$torch_index" | sed 's:/*$::; s:.*/::')"
+          printf '%s' "$flavour" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' \
+            || { echo "the last segment of torch_index '$torch_index' is not usable in a tag: '$flavour'" >&2; exit 1; }
+          # A tag is 128 characters at most and a ref can be longer.
           slug="$(printf '%s' "$ref" | tr -cs 'A-Za-z0-9._-' '-' | cut -c1-40 | sed 's/^-*//; s/-*$//')"
-          arch_tag="$(printf '%s' "$arch" | tr -c 'A-Za-z0-9._-' '-')"
           [ -n "$slug" ] || slug=ref
-          image=decider-gguf
-          tag="cu12.4.1-${slug}-sm${arch_tag}"
+          image=decider-torch
+          tag="${flavour}-${slug}"
           name="${image}-${tag}-amd64"
           {
             echo "ref=$ref"
-            echo "arch=$arch"
             echo "torch_index=$torch_index"
+            echo "torch_spec=$torch_spec"
+            echo "flavour=$flavour"
             echo "image=$image"
             echo "tag=$tag"
             echo "name=$name"
@@ -82,10 +87,10 @@ jobs:
             echo "IMAGE_REF=$image:$tag"
             echo "ARTIFACT_NAME=$name"
             echo "UPSTREAM_REF=$ref"
-            echo "LLAMA_CUDA_ARCH=$arch"
             echo "TORCH_INDEX=$torch_index"
+            echo "TORCH_SPEC=$torch_spec"
           } >> "$GITHUB_ENV"
-          echo "### decider-gguf : \`$image:$tag\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "### decider-torch : \`$image:$tag\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build image
         uses: docker/build-push-action@v6
@@ -99,26 +104,20 @@ jobs:
           tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
           build-args: |
             DECIDER_REF=${{ steps.meta.outputs.ref }}
-            LLAMA_CUDA_ARCH=${{ steps.meta.outputs.arch }}
             TORCH_INDEX=${{ steps.meta.outputs.torch_index }}
+            TORCH_SPEC=${{ steps.meta.outputs.torch_spec }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # The runner has no GPU, and this image deliberately does not carry libcuda.so.1 -- the host driver injects
-      # it at run time -- so nothing can be *loaded* here. The build already does that, against the driver stub
-      # that the -devel image ships. What this checks is the image buildx just loaded on the runner, the one the
-      # next step saves: that the CUDA backend and the GGUF HTTP server survived into it. Both checks are fatal: an
-      # image without them is worse than no artifact, because llama.cpp drops to the CPU in silence.
+      # The runner has no GPU, and this image deliberately does not carry libcuda.so.1 -- the host driver
+      # injects it at run time -- so the engine cannot be built here. What can be checked is the image buildx
+      # just loaded, the one the next step saves; scripts/check_image.py is the same file the build already ran
+      # inside that image, so this is a re-run of the same contract on the artifact, not a second opinion.
       - name: Smoke test
         run: |
           set -euo pipefail
           docker image inspect --format 'image id={{.Id}} size={{.Size}} bytes' "$IMAGE_REF"
-          # Why not `sh -c 'lib=/opt/venv/lib/python3*/...; ls "$lib"'`: an assignment does not glob, and a wildcard
-          # that arrives through a quoted "$lib" is literal to the shell -- so the pattern never matched and the
-          # check failed with it unexpanded. Python's glob has no such trap, and it is what the runtime stage asserts
-          # with, so both find the directory the same way.
-          docker run --rm "$IMAGE_REF" python -c "import glob,os,sys;hits=sorted(glob.glob('/opt/venv/lib/python3*/site-packages/llama_cpp/lib/libggml-cuda.so*'));print('llama_cpp cuda libs:',[os.path.basename(h) for h in hits]);sys.exit(0 if hits else 'no CUDA backend in the saved image: llama.cpp would fall back to the CPU in silence')"
-          docker run --rm "$IMAGE_REF" python -c "import sys;sys.path.insert(0,'/app/scripts');import serve_gguf,fastapi,uvicorn;print('serve routes',sorted(r.path for r in serve_gguf.app.routes));print('fastapi',fastapi.__version__,'uvicorn',uvicorn.__version__)"
+          docker run --rm "$IMAGE_REF" python /app/scripts/check_image.py
 
       - name: Save image and checksum
         run: |
@@ -140,17 +139,18 @@ jobs:
             echo "image_id:         $(docker image inspect --format '{{.Id}}' "$IMAGE_REF")"
             echo "image_size_bytes: $(docker image inspect --format '{{.Size}}' "$IMAGE_REF")"
             echo "platform:         linux/amd64"
-            echo "base:             nvidia/cuda:12.4.1-runtime-ubuntu22.04"
+            echo "base:             python:3.12-slim-bookworm"
+            echo "engine:           decider.serve on decider.engine_v2.EngineV2 (torch)"
             echo "upstream:         https://github.com/Mapika/decider @ ${UPSTREAM_REF}"
-            echo "llama_cuda_arch:  ${LLAMA_CUDA_ARCH}"
             echo "torch_index:      ${TORCH_INDEX}"
+            echo "torch_spec:       ${TORCH_SPEC}"
             echo "tar_gz:           ${ARTIFACT_NAME}.tar.gz"
             echo "tar_gz_bytes:     $(stat -c %s "${ARTIFACT_NAME}.tar.gz")"
             echo "tar_gz_sha256:    $(cut -d' ' -f1 "${ARTIFACT_NAME}.tar.gz.sha256")"
             echo "built_at:         $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "run:              ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo "--- runtime ---"
-            docker run --rm "$IMAGE_REF" python -c "import importlib.metadata as m,sys;print('python='+sys.version.split()[0]);print('\n'.join(p+'='+m.version(p) for p in ('decider-ai','llama-cpp-python','torch','transformers','flash-linear-attention','fastapi','uvicorn')))" \
+            docker run --rm "$IMAGE_REF" python -c "import importlib.metadata as m,sys;print('python='+sys.version.split()[0]);print('\n'.join(p+'='+m.version(p) for p in ('decider-ai','torch','transformers','flash-linear-attention','triton','numpy','fastapi','uvicorn')))" \
               || echo "runtime probe failed (not fatal)"
           } | tee "${ARTIFACT_NAME}.manifest.txt"
 
@@ -178,21 +178,26 @@ jobs:
             echo "| image | \`$IMAGE_REF\` |"
             echo "| artifact | \`$ARTIFACT_NAME\` (tar.gz + .sha256 + .manifest.txt) |"
             echo "| upstream | \`https://github.com/Mapika/decider @ ${UPSTREAM_REF}\` |"
-            echo "| base | \`nvidia/cuda:12.4.1-runtime-ubuntu22.04\` |"
+            echo "| base | \`python:3.12-slim-bookworm\` + \`${TORCH_INDEX}\` |"
+            echo "| weights | not included -- mount the checkpoint |"
             echo ""
-            echo "Load on the host, then either of:"
+            echo "Load on the host (\`--gpus all\` and a driver that allows CUDA 12.4), then:"
             echo ""
             echo '```bash'
             echo "gzip -dc ${ARTIFACT_NAME}.tar.gz | docker load"
-            echo "docker run --rm --gpus all -v /srv/decider-4b-GGUF:/models ${IMAGE_REF} \\"
-            echo "  python -m decider.infer /models/decider-4b-v2.1-Q4_K_M.gguf"
-            echo '```'
             echo ""
-            echo "HTTP API on llama.cpp (scripts/serve.sh ships in the image; upstream's serve.sh is the torch engine and cannot read a GGUF):"
+            echo "# model from the Hub: both volumes matter, ~4 GB download and a JIT of the Triton kernels"
+            echo "docker run --rm --gpus all -p 8000:8000 \\"
+            echo "  -v decider-hf:/hf-cache -v decider-triton:/triton-cache \\"
+            echo "  ${IMAGE_REF} scripts/serve.sh Mapika/decider-2b 8000"
             echo ""
-            echo '```bash'
-            echo "docker run --rm --gpus all -p 8000:8000 -v /srv/decider-4b-GGUF:/models ${IMAGE_REF} \\"
-            echo "  scripts/serve.sh /models/decider-4b-v2.1-Q4_K_M.gguf 8000"
+            echo "# or a checkpoint folder already on the host: nothing is downloaded, nothing to persist"
+            echo "docker run --rm --gpus all -p 8000:8000 -v /srv/decider-2b:/models/decider-2b:ro \\"
+            echo "  ${IMAGE_REF} scripts/serve.sh /models/decider-2b 8000"
+            echo ""
             echo "curl -s localhost:8000/health"
             echo '```'
+            echo ""
+            echo "Start-up is not instant: Triton compiles its kernels for the target GPU once, then \`decider.serve\`"
+            echo "captures its whole CUDA graph grid before answering. \`DECIDER_WARMUP=0\` skips the capture."
           } >> "$GITHUB_STEP_SUMMARY"

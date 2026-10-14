@@ -1,5 +1,5 @@
-# The upstream source is fetched inside the image, so the build context is the Dockerfile plus this repo's
-# own scripts/ (the GGUF HTTP server that gets copied into the image) -- and nothing else.
+# The upstream source is fetched inside the image, so the build context is the Dockerfile plus the two files
+# this repo adds to it -- and nothing else.
 
 **
 
@@ -8,4 +8,4 @@
 # The directory itself has to be re-included or the walker never descends into it.
 !scripts
 !scripts/serve.sh
-!scripts/serve_gguf.py
+!scripts/check_image.py
