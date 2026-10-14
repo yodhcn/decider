@@ -121,6 +121,48 @@ def check_cache_dirs_are_writable():
     return "writable: " + ", ".join(dirs)
 
 
+def _triton_cache_dir():
+    """What Triton itself reports as its cache directory.
+
+    Neither path below is a library default -- huggingface_hub would use ~/.cache/huggingface and Triton
+    $TRITON_HOME/.triton/cache (i.e. /root/.triton/cache as root), both inside the container's writable layer,
+    i.e. gone with the container.  Asking the library is the point: reading TRITON_CACHE_DIR back and calling
+    it verified would pass even after Triton stopped honouring that variable.
+    """
+    import triton.runtime.cache as cache
+    knobs = getattr(cache, "knobs", None)          # triton >= 3.4 routes this through knobs.cache.dir
+    if knobs is not None:
+        return knobs.cache.dir
+    return cache.default_cache_dir()               # older releases read the variable directly
+
+
+def check_caches_point_where_we_set_them():
+    """Two independent ways this breaks.  An empty TRITON_CACHE_DIR is not "no caching" -- Triton's
+    FileCacheManager raises RuntimeError('Could not create or locate cache dir') on every single compile.  And a
+    library that quietly stopped reading the variable sends the cache outside the mounted volume, where it is
+    silently lost on the next container.  Both are invisible to a check that re-reads the variable."""
+    want = os.environ.get("TRITON_CACHE_DIR") or ""
+    assert want, ("TRITON_CACHE_DIR is unset or empty; Triton would abort every compile with 'Could not create "
+                  "or locate cache dir' rather than fall back to a default")
+    got = _triton_cache_dir()
+    assert got == want, (f"triton caches to {got!r}, but TRITON_CACHE_DIR is {want!r}: compiled kernels would "
+                         f"land outside the mounted volume and be rebuilt every container")
+    detail = f"triton -> {got}"
+
+    try:
+        import huggingface_hub.constants as hf
+    except ImportError:                            # only reachable if the hub client is not installed at all
+        return detail
+    hub = getattr(hf, "HF_HUB_CACHE", None)
+    if hub is None:
+        return detail
+    home = (os.environ.get("HF_HOME") or "/hf-cache").rstrip("/")
+    assert hub == home or hub.startswith(home + "/"), (
+        f"huggingface_hub caches to {hub}, outside HF_HOME={home!r}: the checkpoint would be re-downloaded "
+        f"every container even with /hf-cache mounted")
+    return f"{detail}; hub -> {hub}"
+
+
 CHECKS = (
     ("torch is the cu124 build", check_torch_is_the_cuda_build),
     ("cuda libraries resolve", check_cuda_libraries_resolve),
@@ -129,6 +171,7 @@ CHECKS = (
     ("dependency versions", check_dependency_versions),
     ("entrypoint script", check_entrypoint_script),
     ("cache dirs writable", check_cache_dirs_are_writable),
+    ("caches honour the env", check_caches_point_where_we_set_them),
     ("no baked-in weights", check_no_weights_are_baked_in),
 )
 

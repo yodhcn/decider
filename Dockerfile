@@ -65,6 +65,12 @@ ARG DECIDER_REF
 ARG TORCH_INDEX
 ARG TORCH_SPEC
 
+# HF_HOME and TRITON_CACHE_DIR are not library defaults -- they are this image's choice of where the two caches
+# live, and the volumes below mount exactly these paths.  Left alone, huggingface_hub would use
+# ~/.cache/huggingface and Triton $TRITON_HOME/.triton/cache, i.e. /root/.triton/cache as root: both inside the
+# container's writable layer, so both die with the container and a long mount: nothing notices.
+# scripts/check_image.py asks each library where it actually caches rather than reading these back, so a library
+# that stops honouring one of them fails the build instead of silently dropping the cache on the floor.
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \

@@ -67,10 +67,14 @@ curl -s localhost:8000/v1/models
 
 ### 两个卷为什么值
 
-| 卷 | 环境变量 | 不挂会怎样 |
-|---|---|---|
-| `/hf-cache` | `HF_HOME` | 用仓库 ID 时，每次新建容器都重新下 4 GB（2B bf16）/ 8.4 GB（4B）。用本地目录则完全用不到 |
-| `/triton-cache` | `TRITON_CACHE_DIR` | flash-linear-attention 的 Triton kernel 是针对具体 GPU JIT 编译的，cubin 与机器绑定，**没法预先打进镜像**；不挂就每次重编 |
+| 卷 | 环境变量 | 库自己的默认路径 | 不挂会怎样 |
+|---|---|---|---|
+| `/hf-cache` | `HF_HOME` | `~/.cache/huggingface`（root → `/root/.cache/huggingface`） | 用仓库 ID 时，每次新建容器都重新下 4 GB（2B bf16）/ 8.4 GB（4B）。用本地目录则完全用不到 |
+| `/triton-cache` | `TRITON_CACHE_DIR` | `$TRITON_HOME/.triton/cache`（root → `/root/.triton/cache`） | flash-linear-attention 的 Triton kernel 是针对具体 GPU JIT 编译的，cubin 与机器绑定，**没法预先打进镜像**；不挂就每次重编 |
+
+两个路径名都是**这个镜像起的**，不是库的约定——`Dockerfile:74` 的 `ENV` 把它们指过去，卷挂的正是这两个路径。之所以必须显式指：库的默认位置在容器的可写层里，容器一删缓存就没了。
+
+⚠️ 一个坑：`TRITON_CACHE_DIR` **设成空字符串不等于「不缓存」**，Triton 的 `FileCacheManager` 会直接 `RuntimeError: Could not create or locate cache dir`，每次编译都炸。不要 `-e TRITON_CACHE_DIR=`。
 
 ## 启动不是瞬间的
 
@@ -126,7 +130,7 @@ sha256sum -c decider-torch-*.tar.gz.sha256
 gzip -dc decider-torch-*.tar.gz | docker load
 ```
 
-镜像契约由 `scripts/check_image.py` 定义，**构建期和 CI smoke test 跑的是同一个文件**，两边不会漂。8 项检查（全部不需要 GPU）：
+镜像契约由 `scripts/check_image.py` 定义，**构建期和 CI smoke test 跑的是同一个文件**，两边不会漂。9 项检查（全部不需要 GPU）：
 
 1. torch 是 cu124 构建 —— 装成 CPU 轮子会让整个引擎静默跑在 CPU 上
 2. torch 的 CUDA 动态依赖在镜像内全部可解析，只允许宿主驱动那几个缺失（按精确名白名单，`libcuda*` 前缀会把 `libcudart.so.12` 一起放行）
@@ -135,7 +139,8 @@ gzip -dc decider-torch-*.tar.gz | docker load
 5. `transformers>=5`
 6. `scripts/serve.sh` 存在、可执行、bash 语法干净、确实启动 `decider.serve:app`
 7. `/hf-cache` 与 `/triton-cache` 可写
-8. 没有把权重打进镜像
+8. 两个缓存**确实落在上面那两个路径** —— 问 Triton 与 huggingface_hub 自己要缓存目录，而不是回读环境变量；库哪天不认这个变量，构建就红，而不是默默把缓存丢在容器可写层里
+9. 没有把权重打进镜像
 
 单跑：
 
