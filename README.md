@@ -74,7 +74,11 @@ curl -s localhost:8000/v1/models
 
 两个路径名都是**这个镜像起的**，不是库的约定——`Dockerfile:74` 的 `ENV` 把它们指过去，卷挂的正是这两个路径。之所以必须显式指：库的默认位置在容器的可写层里，容器一删缓存就没了。
 
-⚠️ 一个坑：`TRITON_CACHE_DIR` **设成空字符串不等于「不缓存」**，Triton 的 `FileCacheManager` 会直接 `RuntimeError: Could not create or locate cache dir`，每次编译都炸。不要 `-e TRITON_CACHE_DIR=`。
+⚠️ 一个坑：`TRITON_CACHE_DIR` **设成空字符串不等于「不缓存」**，且行为随版本变：
+- triton 3.2（torch 2.6.0+cu124 钉的版本）里是 `os.getenv("TRITON_CACHE_DIR", "").strip() or default_cache_dir()` → **静默回落到 `/root/.triton/cache`**，缓存照样写，只是写到了卷外；
+- triton ≥3.4 的 `knobs.cache.dir` 拿到空串后 falsy → 每次编译 `RuntimeError: Could not create or locate cache dir`。
+
+两种情况都别踩，不要写 `-e TRITON_CACHE_DIR=`。
 
 ## 启动不是瞬间的
 
@@ -139,7 +143,7 @@ gzip -dc decider-torch-*.tar.gz | docker load
 5. `transformers>=5`
 6. `scripts/serve.sh` 存在、可执行、bash 语法干净、确实启动 `decider.serve:app`
 7. `/hf-cache` 与 `/triton-cache` 可写
-8. 两个缓存**确实落在上面那两个路径** —— 问 Triton 与 huggingface_hub 自己要缓存目录，而不是回读环境变量；库哪天不认这个变量，构建就红，而不是默默把缓存丢在容器可写层里
+8. 两个缓存**确实落在上面那两个路径** —— 问 `FileCacheManager` 自己刚建出来的目录在哪、问 `huggingface_hub.constants.HF_HUB_CACHE` 在哪，而不是回读环境变量（回读是循环论证：库不认这个变量也照样通过）。⚠️ 不能拿 triton 的 `default_cache_dir()` 当答案——3.2 里它**只是 fallback、恒返回 `~/.triton/cache`**，跟环境变量无关，第一版检查就栽在这（构建期假红）
 9. 没有把权重打进镜像
 
 单跑：

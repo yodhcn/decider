@@ -121,33 +121,44 @@ def check_cache_dirs_are_writable():
     return "writable: " + ", ".join(dirs)
 
 
-def _triton_cache_dir():
-    """What Triton itself reports as its cache directory.
+def _triton_cache_probe():
+    """The per-key directory Triton has just created -- asked of Triton, not modelled from its API.
 
-    Neither path below is a library default -- huggingface_hub would use ~/.cache/huggingface and Triton
-    $TRITON_HOME/.triton/cache (i.e. /root/.triton/cache as root), both inside the container's writable layer,
-    i.e. gone with the container.  Asking the library is the point: reading TRITON_CACHE_DIR back and calling
-    it verified would pass even after Triton stopped honouring that variable.
+    The obvious query lies, twice over.  triton 3.2 (what torch 2.6.0+cu124 pins) has no knobs module at all,
+    and its default_cache_dir() is only the *fallback*: it returns $TRITON_HOME/.triton/cache whatever
+    TRITON_CACHE_DIR says, so reporting it as "where triton caches" fails a correct image.  triton >= 3.4 does
+    expose knobs.cache.dir, but guessing which generation is installed is the mistake to avoid, not to make
+    twice.  What every generation shares is the cache manager, and its constructor is the code that actually
+    turns the setting into a directory -- so ask that one, and let it create the directory as proof.
     """
-    import triton.runtime.cache as cache
-    knobs = getattr(cache, "knobs", None)          # triton >= 3.4 routes this through knobs.cache.dir
-    if knobs is not None:
-        return knobs.cache.dir
-    return cache.default_cache_dir()               # older releases read the variable directly
+    from triton.runtime.cache import get_cache_manager
+    manager = get_cache_manager("00")              # any hex key; its encoding names the per-key subdirectory
+    per_key = getattr(manager, "cache_dir", None)
+    assert per_key, (f"{type(manager).__name__} reports no cache_dir: TRITON_CACHE_MANAGER is set to a manager "
+                     f"this check cannot probe")
+    return per_key
 
 
 def check_caches_point_where_we_set_them():
-    """Two independent ways this breaks.  An empty TRITON_CACHE_DIR is not "no caching" -- Triton's
-    FileCacheManager raises RuntimeError('Could not create or locate cache dir') on every single compile.  And a
-    library that quietly stopped reading the variable sends the cache outside the mounted volume, where it is
-    silently lost on the next container.  Both are invisible to a check that re-reads the variable."""
-    want = os.environ.get("TRITON_CACHE_DIR") or ""
-    assert want, ("TRITON_CACHE_DIR is unset or empty; Triton would abort every compile with 'Could not create "
-                  "or locate cache dir' rather than fall back to a default")
-    got = _triton_cache_dir()
-    assert got == want, (f"triton caches to {got!r}, but TRITON_CACHE_DIR is {want!r}: compiled kernels would "
-                         f"land outside the mounted volume and be rebuilt every container")
-    detail = f"triton -> {got}"
+    """Three ways this breaks, none of them visible to a check that reads the variable back and trusts it.  An
+    empty TRITON_CACHE_DIR is not "no caching": on 3.2 it silently falls back to ~/.triton/cache, and on the
+    knobs releases it makes every compile raise.  A library that stopped honouring the variable sends the
+    kernels outside the mounted volume, where the next container rebuilds them.  A read-only volume fails here
+    instead of at the first request."""
+    want = (os.environ.get("TRITON_CACHE_DIR") or "").strip()
+    assert want, ("TRITON_CACHE_DIR is unset or empty, which Triton does not read as 'no caching': 3.2 falls "
+                  "back to $TRITON_HOME/.triton/cache and the knobs releases raise on every compile")
+    per_key = _triton_cache_probe()
+    try:
+        assert per_key.startswith(want.rstrip("/") + "/"), (
+            f"triton compiles into {os.path.dirname(per_key)!r}, outside TRITON_CACHE_DIR={want!r}: the mounted "
+            f"volume would not cover the kernels and every container would rebuild them")
+    finally:
+        try:
+            os.rmdir(per_key)                      # empty or not: only removes a directory we just created
+        except OSError:
+            pass
+    detail = f"triton -> {os.path.dirname(per_key)}"
 
     try:
         import huggingface_hub.constants as hf
