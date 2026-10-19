@@ -10,7 +10,7 @@
 #
 #   docker run --rm --gpus all -p 8000:8000 \
 #     -v decider-hf:/hf-cache -v decider-triton:/triton-cache \
-#     decider-torch:cu124 scripts/serve.sh Mapika/decider-2b 8000
+#     decider-torch:cu126 scripts/serve.sh Mapika/decider-2b 8000
 #
 # DECIDER_HOST defaults to 0.0.0.0, unlike upstream's script: 127.0.0.1 inside a container is not reachable
 # through a published port, so that default only looks like a hung port mapping.  There is NO authentication

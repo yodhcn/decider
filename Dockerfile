@@ -10,16 +10,28 @@
 #   server ......... decider.serve:app
 #                    POST /decide  POST /v1/systemone  GET /health /v1/models /stats
 #   in the image ... the upstream source at DECIDER_REF, installed as decider-ai[serve]
-#                    Python 3.12, torch from the cu124 index
+#                    Python 3.12, torch 2.7.1 from the cu126 index (triton 3.3.1), causal_conv1d
 #                    scripts/{serve.sh,check_image.py}
 #
 # Why python:3.12-slim and not an nvidia/cuda base.  Everything CUDA this image needs arrives through pip:
-# torch is installed from https://download.pytorch.org/whl/cu124, which pulls cudart / cuBLAS / cuDNN / NCCL /
+# torch is installed from https://download.pytorch.org/whl/cu126, which pulls cudart / cuBLAS / cuDNN / NCCL /
 # nvrtc into site-packages, and Triton -- what flash-linear-attention's Qwen3.5 Gated DeltaNet kernels run on
 # -- ships its own ptxas, so no nvcc is involved either.  An nvidia/cuda base would stack a *second*,
 # separately versioned CUDA user space on top of the one torch already carries, for no gain.  The one CUDA
 # component no base image has is libcuda.so.1: the host driver injects it at container start through the
-# NVIDIA container runtime.  Driver 550.90.12 on the A40 host caps CUDA at 12.4, which is why cu124.
+# NVIDIA container runtime.
+#
+# Why cu126 and not cu124, although the host driver is 550.90.12 -- the CUDA 12.4 *toolkit* driver.  CUDA 12.x
+# is minor-version compatible: an application built against any 12.x toolkit runs on any driver >= 525, so the
+# driver is not what constrains this image.  Triton is.  flash-linear-attention 0.5.2 declares triton >= 3.3
+# (fla/utils/_device.py, warning only), and the cu124 index stops at torch 2.6.0, which pins triton 3.2.0.
+# Below that floor the damage is quiet: fla's get_available_device() swallows whatever the platform probe
+# raised on 3.2, warns "roll back to CPU", @cache's that answer for the rest of the process, and transformers
+# silently switches to the reference O(N^2) gated-delta-rule -- on an A40 that is both slow and an
+# out-of-memory at 4B, which is exactly how the first real run died.  torch 2.7.1 (cu126) pins triton 3.3.1,
+# and triton 3.3 still compiles sm_86 with ptxas 12.4.99 -- the same ptxas as 3.2.0, so the generated kernels
+# do not change, only the floor is met.  cu128 (triton 3.4, ptxas 12.8) also runs on this driver, but it moves
+# the codegen for no benefit here; CUDA 13 would need driver >= 580 and is out.
 #
 # There is nothing to compile here -- no llama.cpp, no CUDA kernels -- so the build is one stage and one
 # index.  flash-linear-attention's Triton kernels JIT-compile against the target GPU the first time a hybrid
@@ -27,24 +39,24 @@
 # points at a path meant to be mounted and kept (see below).
 #
 # Build
-#   docker build -t decider-torch:cu124 .
+#   docker build -t decider-torch:cu126 .
 #
 # Run -- HTTP API, model from the Hub.  Without the /hf-cache volume every fresh container re-downloads the
 # checkpoint; without /triton-cache every fresh container re-JITs the kernels.
 #   docker run --rm --gpus all -p 8000:8000 \
 #     -v decider-hf:/hf-cache -v decider-triton:/triton-cache \
-#     decider-torch:cu124 scripts/serve.sh Mapika/decider-2b 8000
+#     decider-torch:cu126 scripts/serve.sh Mapika/decider-2b 8000
 #
 # Run -- a local checkpoint folder: nothing is downloaded and nothing needs to persist.
 #   docker run --rm --gpus all -p 8000:8000 -v /srv/decider-2b:/models/decider-2b:ro \
-#     decider-torch:cu124 scripts/serve.sh /models/decider-2b 8000
+#     decider-torch:cu126 scripts/serve.sh /models/decider-2b 8000
 #
 # Run -- upstream's own scripts/serve.sh, which is also in the image at /opt/decider/scripts/serve.sh.  It
 # works unmodified here because this image presets the two things that assume upstream's dev checkout:
 # DECIDER_HOST (its default 127.0.0.1 is unreachable through a published port) and UVICORN (its default
 # .venv312/bin/uvicorn only exists after upstream's own `uv venv`).
 #   docker run --rm --gpus all -p 8000:8000 -v decider-hf:/hf-cache \
-#     decider-torch:cu124 /opt/decider/scripts/serve.sh Mapika/decider-2b 8000
+#     decider-torch:cu126 /opt/decider/scripts/serve.sh Mapika/decider-2b 8000
 #
 # The default command is `tail -f /dev/null`; a command after the image name replaces it entirely.
 
@@ -52,11 +64,16 @@ ARG PYTHON_VERSION=3.12
 ARG DECIDER_REPO=https://github.com/Mapika/decider
 ARG DECIDER_REF=main
 # decider-ai requires a bare, unpinned `torch`, so the wheel is installed first and the rest of the
-# dependency graph reuses it instead of pulling a different build in behind it.  For cp312 the cu124 index
-# tops out at torch 2.6.0 -- the newest CUDA torch driver 550 allows; later wheels are cu126/cu128.
-# Pin with --build-arg TORCH_SPEC=torch==2.6.0; whatever lands is printed into the build log.
-ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
-ARG TORCH_SPEC=torch
+# dependency graph reuses it instead of pulling a different build in behind it.  2.7.1 is the oldest wheel
+# that pins triton >= 3.3 (it asks for 3.3.1); 2.8.0 would ask for 3.4.0 and compile sm_86 with ptxas 12.8.
+# cu124 tops out at 2.6.0, whose triton 3.2.0 is below flash-linear-attention's floor.
+# Pin exactly: --build-arg TORCH_SPEC=torch==2.7.1; whatever lands is printed into the build log.
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu126
+ARG TORCH_SPEC=torch==2.7.1
+# causal_conv1d: no sdist builds without nvcc, so this is the prebuilt wheel, matched to the exact
+# (torch minor, cpython, C++ ABI) triple that ended up installed.  Bump the tag to move versions.
+ARG CCV_VERSION=1.7.0
+ARG CCV_TAG=v1.7.0
 
 FROM python:${PYTHON_VERSION}-slim-bookworm
 
@@ -64,6 +81,8 @@ ARG DECIDER_REPO
 ARG DECIDER_REF
 ARG TORCH_INDEX
 ARG TORCH_SPEC
+ARG CCV_VERSION
+ARG CCV_TAG
 
 # HF_HOME and TRITON_CACHE_DIR are not library defaults -- they are this image's choice of where the two caches
 # live, and the volumes below mount exactly these paths.  Left alone, huggingface_hub would use
@@ -122,9 +141,28 @@ RUN set -eux; \
 RUN set -eux; \
     pip install "/opt/decider[serve]"
 
+# causal_conv1d, the fourth piece of the Qwen3.5 hybrid layer and the one that has to be binary-matched: the
+# wheel is pinned to a torch minor, a cpython tag and torch's C++ ABI, so the name is derived here instead of
+# written down.  A wrong name is a 404, and a wrong ABI is an import error the check_image step would catch --
+# either way better than the alternative, which is transformers quietly using its reference conv.
+#   torch >= 2.7 wheels are CXX11_ABI=1; the other spelling is tried once rather than assumed.
+RUN set -eux; \
+    torch_xy="$(python -c 'import torch;print(".".join(torch.__version__.split("+")[0].split(".")[:2]))')"; \
+    abi="$(python -c 'import torch;print("TRUE" if torch._C._GLIBCXX_USE_CXX11_ABI else "FALSE")')"; \
+    py="$(python -c 'import sys;print("cp%d%d" % sys.version_info[:2])')"; \
+    base="https://github.com/Dao-AILab/causal-conv1d/releases/download/${CCV_TAG}"; \
+    ok=""; \
+    for a in "$abi" "$(if [ "$abi" = TRUE ]; then echo FALSE; else echo TRUE; fi)"; do \
+      url="${base}/causal_conv1d-${CCV_VERSION}+cu12torch${torch_xy}cxx11abi${a}-${py}-${py}-linux_x86_64.whl"; \
+      if pip install --no-deps "$url"; then ok="$url"; break; fi; \
+      echo "no wheel: $url" >&2; \
+    done; \
+    test -n "$ok" || { echo "no causal_conv1d ${CCV_VERSION} wheel for torch ${torch_xy} / ${py} / ${abi}" >&2; exit 1; }; \
+    echo "causal_conv1d: $ok"
+
 # The upstream has no lockfile, so the resolver's choices are only pinned down here.  Printed into the build
 # log and, in the workflow, into the artifact manifest.
-RUN python -c "import importlib.metadata as m,sys;print('python='+sys.version.split()[0]);print(' '.join(p+'='+m.version(p) for p in ('decider-ai','torch','transformers','flash-linear-attention','triton','numpy','fastapi','uvicorn')))"
+RUN python -c "import importlib.metadata as m,sys;print('python='+sys.version.split()[0]);print(' '.join(p+'='+m.version(p) for p in ('decider-ai','torch','transformers','flash-linear-attention','triton','causal_conv1d','numpy','fastapi','uvicorn')))"
 
 COPY scripts /app/scripts
 
@@ -136,7 +174,7 @@ RUN set -eux; \
     python /app/scripts/check_image.py
 
 LABEL org.opencontainers.image.title="decider-torch" \
-      org.opencontainers.image.description="decider (Mapika/decider) on the torch engine: decider.serve over CUDA 12.4.1 / cu124; weights are not included" \
+      org.opencontainers.image.description="decider (Mapika/decider) on the torch engine: decider.serve over CUDA 12.6 / cu126, torch 2.7.1, triton 3.3.1; weights are not included" \
       org.opencontainers.image.source="https://github.com/Mapika/decider" \
       org.opencontainers.image.revision="${DECIDER_REF}" \
       org.opencontainers.image.licenses="Apache-2.0"

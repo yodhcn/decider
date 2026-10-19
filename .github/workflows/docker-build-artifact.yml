@@ -1,6 +1,6 @@
 name: docker-build-artifact
 
-# Builds the CUDA 12.4.1 / torch image (decider.serve on decider.engine_v2.EngineV2) and uploads it as a
+# Builds the CUDA 12.6 / torch 2.7.1 image (decider.serve on decider.engine_v2.EngineV2) and uploads it as a
 # workflow artifact (`docker save | gzip`). Nothing is pushed to a registry: download the artifact from the run
 # page and `gzip -dc decider-torch-*.tar.gz | docker load`.
 #
@@ -14,13 +14,13 @@ on:
         required: false
         default: "main"
       torch_index:
-        description: "PyTorch wheel index. cu124 is what the target driver allows (it caps CUDA at 12.4). The last path segment becomes part of the tag; pypi.org/simple would mean 'torch however PyPI ships it'."
+        description: "PyTorch wheel index. cu126, not cu124: CUDA 12.x is minor-version compatible, so the 550 driver runs it, and cu124 stops at torch 2.6.0 (triton 3.2.0, below flash-linear-attention's 3.3 floor). The last path segment becomes part of the tag."
         required: false
-        default: "https://download.pytorch.org/whl/cu124"
+        default: "https://download.pytorch.org/whl/cu126"
       torch_spec:
-        description: "Requirement to install from that index. 'torch' takes the newest cu124 wheel for cp312 (2.6.0); pin with torch==2.6.0 for a reproducible build."
+        description: "Requirement to install from that index. torch==2.7.1 pins triton 3.3.1, which is what fla requires; 2.8.0 pins triton 3.4.0 and compiles sm_86 with ptxas 12.8. 'torch' takes the newest wheel in the index."
         required: false
-        default: "torch"
+        default: "torch==2.7.1"
 
 permissions:
   contents: read
@@ -32,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # torch's cu124 wheels carry their own CUDA user space (cudart, cuBLAS, cuDNN, NCCL, nvrtc) and a hosted
+      # torch's CUDA wheels carry their own CUDA user space (cudart, cuBLAS, cuDNN, NCCL, nvrtc) and a hosted
       # runner has roughly 14 GB free, which the venv plus the saved tar will not fit in.
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
@@ -54,8 +54,8 @@ jobs:
         run: |
           set -euo pipefail
           ref="${IN_UPSTREAM_REF:-main}"
-          torch_index="${IN_TORCH_INDEX:-https://download.pytorch.org/whl/cu124}"
-          torch_spec="${IN_TORCH_SPEC:-torch}"
+          torch_index="${IN_TORCH_INDEX:-https://download.pytorch.org/whl/cu126}"
+          torch_spec="${IN_TORCH_SPEC:-torch==2.7.1}"
           # An input is refused rather than escaped: none of the three can contain a space, a quote or a newline.
           printf '%s' "$ref" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]*$' \
             || { echo "refusing upstream_ref '$ref'" >&2; exit 1; }
@@ -150,7 +150,7 @@ jobs:
             echo "built_at:         $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "run:              ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo "--- runtime ---"
-            docker run --rm "$IMAGE_REF" python -c "import importlib.metadata as m,sys;print('python='+sys.version.split()[0]);print('\n'.join(p+'='+m.version(p) for p in ('decider-ai','torch','transformers','flash-linear-attention','triton','numpy','fastapi','uvicorn')))" \
+            docker run --rm "$IMAGE_REF" python -c "import importlib.metadata as m,sys;print('python='+sys.version.split()[0]);print('\n'.join(p+'='+m.version(p) for p in ('decider-ai','torch','transformers','flash-linear-attention','triton','causal_conv1d','numpy','fastapi','uvicorn')))" \
               || echo "runtime probe failed (not fatal)"
           } | tee "${ARTIFACT_NAME}.manifest.txt"
 
@@ -181,7 +181,7 @@ jobs:
             echo "| base | \`python:3.12-slim-bookworm\` + \`${TORCH_INDEX}\` |"
             echo "| weights | not included -- mount the checkpoint |"
             echo ""
-            echo "Load on the host (\`--gpus all\` and a driver that allows CUDA 12.4), then:"
+            echo "Load on the host (\`--gpus all\`, and a driver that allows CUDA 12.x -- >= 525; the 550.90.12 host qualifies), then:"
             echo ""
             echo '```bash'
             echo "gzip -dc ${ARTIFACT_NAME}.tar.gz | docker load"
@@ -199,5 +199,6 @@ jobs:
             echo '```'
             echo ""
             echo "Start-up is not instant: Triton compiles its kernels for the target GPU once, then \`decider.serve\`"
-            echo "captures its whole CUDA graph grid before answering. \`DECIDER_WARMUP=0\` skips the capture."
+            echo "captures its whole CUDA graph grid (89 graphs) before answering. \`DECIDER_WARMUP=0\` skips the capture."
+            echo "On a 44 GiB A40 that grid does not fit at 4B -- shrink it with \`DECIDER_B_BUCKETS=1,2,4\` (51 graphs)."
           } >> "$GITHUB_STEP_SUMMARY"

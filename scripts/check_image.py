@@ -12,6 +12,7 @@ import glob
 import importlib.metadata as md
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import sysconfig
@@ -21,10 +22,14 @@ import sysconfig
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.dirname(HERE)
 
-# The CUDA version this image is built against.  Driver 550.90.12 on the target host caps it at 12.4, which is
-# why the cu124 index.  A CPU torch wheel would run the whole engine on the CPU and decider.serve would not say
-# a word -- that silent fallback is the failure this file exists to catch.
-EXPECTED_CUDA = (12, 4)
+# The CUDA *major* this image must stay on.  Minor is free: CUDA 12.x is minor-version compatible, so a cu126
+# wheel runs on the 550.90.12 driver that caps the toolkit at 12.4.  CUDA 13 is not free -- it needs driver
+# >= 580 -- and a CPU torch wheel would run the whole engine on the CPU without decider.serve saying a word.
+EXPECTED_CUDA_MAJOR = 12
+
+# flash-linear-attention's own floor, used only if it cannot be read out of fla (see _fla_triton_floor).
+# Below it, fla does not fail: it caches a 'cpu' platform and transformers switches to a reference kernel.
+MIN_TRITON = "3.3.0"
 
 # What a client of upstream's server needs.  A renamed or dropped route breaks it, quietly, at the client.
 ROUTES = {"/decide", "/v1/systemone", "/health", "/v1/models", "/stats"}
@@ -34,12 +39,37 @@ ROUTES = {"/decide", "/v1/systemone", "/health", "/v1/models", "/stats"}
 DRIVER_LIBS = ("libcuda.so.1", "libnvcuvid.so.1")
 
 
+def _vtuple(s):
+    """`"3.3.1+gitabc"` -> `(3, 3, 1)`.  Comparing these beats importing packaging to compare three numbers."""
+    nums = re.findall(r"\d+", s.split("+")[0])
+    return tuple(int(n) for n in (nums + ["0", "0", "0"])[:3])
+
+
+def _subprocess_python(code):
+    """Run a snippet in a fresh interpreter and return its stdout.
+
+    Used for anything that imports torch-adjacent libraries at module scope: fla's device detection runs on
+    import and prints a warning that only means "this machine has no GPU", which in a build log reads like a
+    defect.  Keeping it out of process keeps the report honest.
+    """
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0, (r.stderr.strip().splitlines() or ["no output"])[-1]
+    return r.stdout.strip()
+
+
 def check_torch_is_the_cuda_build():
     import torch
     cuda = torch.version.cuda or ""
-    assert tuple(int(x) for x in cuda.split(".")[:2]) == EXPECTED_CUDA, (
-        f"torch is not the cu{EXPECTED_CUDA[0]}{EXPECTED_CUDA[1]} build: torch={torch.__version__} "
-        f"cuda={cuda!r}.  A CPU torch runs the engine on the CPU without saying so")
+    assert cuda, (f"torch {torch.__version__} is a CPU build: the engine would run on the CPU and "
+                  f"decider.serve would not mention it")
+    major, minor = (int(x) for x in cuda.split(".")[:2])
+    assert major == EXPECTED_CUDA_MAJOR, (
+        f"torch is built for CUDA {cuda}, but this image has to stay on CUDA {EXPECTED_CUDA_MAJOR}.x: the host "
+        f"driver is 550.90.12, and CUDA 13 requires a >= 580 driver")
+    local = torch.__version__.split("+")[1] if "+" in torch.__version__ else ""
+    assert local == f"cu{major}{minor}", (
+        f"torch {torch.__version__} reports CUDA {cuda} but its wheel is tagged {local!r}: the wheel was built "
+        f"against a different toolkit than it claims")
     return f"torch {torch.__version__}, built for CUDA {cuda}"
 
 
@@ -69,10 +99,60 @@ def check_server_imports_with_every_route():
 
 def check_hybrid_layer_dependencies():
     """Qwen3.5's Gated DeltaNet layers go through flash-linear-attention on Triton.  Miss either and the first
-    forward on the A40 fails -- at request time, where it is expensive to diagnose, not here."""
+    forward on the A40 fails -- at request time, where it is expensive to diagnose, not here.
+
+    Presence only.  Being importable says nothing about being *usable*: triton 3.2.0 imported fine and still
+    sent every hybrid layer to a reference kernel.  That is the next check's job.
+    """
     absent = [m for m in ("triton", "fla") if importlib.util.find_spec(m) is None]
     assert not absent, f"missing module(s) {absent}: the Qwen3.5 hybrid layers cannot run a forward"
     return "triton + flash-linear-attention (module `fla`) present"
+
+
+def _fla_triton_floor():
+    """fla's minimum triton, read out of its source.
+
+    It cannot be imported: `required_triton_version` is a local inside check_environments(), not a module
+    constant.  Falls back to MIN_TRITON if fla reorganises, because the check has to have a floor either way.
+    """
+    try:
+        src = _subprocess_python(
+            "import inspect;from fla.utils import _device;print(inspect.getsource(_device.check_environments))")
+    except AssertionError:
+        return MIN_TRITON, f"fla floor unreadable, using the documented {MIN_TRITON}"
+    m = re.search(r"required_triton_version\s*=\s*package_version\.parse\([\"']([\d.]+)[\"']\)", src)
+    if not m:
+        return MIN_TRITON, f"fla floor not found in its source, using the documented {MIN_TRITON}"
+    return m.group(1), None
+
+
+def check_triton_meets_fla_floor():
+    """The check whose absence cost a real GPU run.
+
+    `find_spec("fla")` passed, the build went green, and the first A40 forward threw: triton was 3.2.0, below
+    fla 0.5.2's declared floor of 3.3.  fla does not raise on that -- and that is the problem.  On 3.2 its
+    `get_available_device()` swallowed whatever the platform probe raised, warned "roll back to CPU", @cache'd
+    the answer, and transformers quietly took the O(N^2) reference path.  The image looked correct and behaved
+    like a different model on different hardware.
+    """
+    import triton
+    floor, note = _fla_triton_floor()
+    got = triton.__version__
+    assert _vtuple(got) >= _vtuple(floor), (
+        f"triton {got} is below {floor}, the floor flash-linear-attention declares: on a GPU this does not "
+        f"error, it silently falls back to the reference O(N^2) kernel -- slow, and OOM at 4B.  Take a torch "
+        f"whose triton is >= {floor} (cu126 + torch 2.7.1 gives 3.3.1)")
+    return f"triton {got} >= {floor}" + (f" ({note})" if note else " (fla's own floor)")
+
+
+def check_conv_kernel_installed():
+    """The same class of silent fallback: without causal_conv1d transformers prints one line and uses its
+    reference conv for every Qwen3.5 hybrid layer.  Imported for real, in a subprocess -- a wheel that installs
+    but cannot load is exactly what a `find_spec` check would have called healthy."""
+    v = _subprocess_python(
+        "import causal_conv1d as c;print(getattr(c, '__version__', '') or 'installed')")
+    assert v, "causal_conv1d imported but reported nothing"
+    return f"causal_conv1d {v}"
 
 
 def check_dependency_versions():
@@ -124,12 +204,13 @@ def check_cache_dirs_are_writable():
 def _triton_cache_probe():
     """The per-key directory Triton has just created -- asked of Triton, not modelled from its API.
 
-    The obvious query lies, twice over.  triton 3.2 (what torch 2.6.0+cu124 pins) has no knobs module at all,
-    and its default_cache_dir() is only the *fallback*: it returns $TRITON_HOME/.triton/cache whatever
-    TRITON_CACHE_DIR says, so reporting it as "where triton caches" fails a correct image.  triton >= 3.4 does
-    expose knobs.cache.dir, but guessing which generation is installed is the mistake to avoid, not to make
-    twice.  What every generation shares is the cache manager, and its constructor is the code that actually
-    turns the setting into a directory -- so ask that one, and let it create the directory as proof.
+    The obvious query lies, twice over.  triton 3.2 and 3.3 -- which is what a torch 2.6/cu124 build and this
+    image's 2.7/cu126 build pin -- have no knobs module at all, and their default_cache_dir() is only the
+    *fallback*: it returns $TRITON_HOME/.triton/cache whatever TRITON_CACHE_DIR says, so reporting it as
+    "where triton caches" fails a correct image.  triton >= 3.4 does expose knobs.cache.dir, but guessing which
+    generation is installed is the mistake to avoid, not to make twice.  What every generation shares is the
+    cache manager, and its constructor is the code that actually turns the setting into a directory -- so ask
+    that one, and let it create the directory as proof.
     """
     from triton.runtime.cache import get_cache_manager
     manager = get_cache_manager("00")              # any hex key; its encoding names the per-key subdirectory
@@ -175,10 +256,12 @@ def check_caches_point_where_we_set_them():
 
 
 CHECKS = (
-    ("torch is the cu124 build", check_torch_is_the_cuda_build),
+    ("torch is a CUDA 12 build", check_torch_is_the_cuda_build),
     ("cuda libraries resolve", check_cuda_libraries_resolve),
     ("decider.serve routes", check_server_imports_with_every_route),
     ("hybrid-layer deps", check_hybrid_layer_dependencies),
+    ("triton meets fla floor", check_triton_meets_fla_floor),
+    ("conv kernel", check_conv_kernel_installed),
     ("dependency versions", check_dependency_versions),
     ("entrypoint script", check_entrypoint_script),
     ("cache dirs writable", check_cache_dirs_are_writable),
