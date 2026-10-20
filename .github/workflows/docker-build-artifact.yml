@@ -1,8 +1,9 @@
 name: docker-build-artifact
 
-# Builds the CUDA 12.6 / torch 2.7.1 image (decider.serve on decider.engine_v2.EngineV2) and uploads it as a
-# workflow artifact (`docker save | gzip`). Nothing is pushed to a registry: download the artifact from the run
-# page and `gzip -dc decider-torch-*.tar.gz | docker load`.
+# Builds the image (decider.serve on decider.engine_v2.EngineV2) on top of pytorch/pytorch -- torch 2.7.1,
+# CUDA 12.6, cuDNN 9, triton 3.3.1 -- and uploads it as a workflow artifact (`docker save | gzip`). Nothing is
+# pushed to a registry: download the artifact from the run page and
+# `gzip -dc decider-torch-*.tar.gz | docker load`.
 #
 # Manual only -- a multi-GB artifact does not belong on every push.
 
@@ -13,14 +14,10 @@ on:
         description: "Mapika/decider git ref: branch, tag or commit SHA"
         required: false
         default: "main"
-      torch_index:
-        description: "PyTorch wheel index. cu126, not cu124: CUDA 12.x is minor-version compatible, so the 550 driver runs it, and cu124 stops at torch 2.6.0 (triton 3.2.0, below flash-linear-attention's 3.3 floor). The last path segment becomes part of the tag."
+      pytorch_image:
+        description: "Base image, tag included. torch, triton and the CUDA user space come from it and are never pip-installed. Default 2.7.1-cuda12.6-cudnn9-runtime: cu126 because CUDA 12.x is minor-version compatible (the 550 driver runs it) and because torch 2.7.1 pins triton 3.3.1, the floor flash-linear-attention declares. Its tag becomes part of the artifact name."
         required: false
-        default: "https://download.pytorch.org/whl/cu126"
-      torch_spec:
-        description: "Requirement to install from that index. torch==2.7.1 pins triton 3.3.1, which is what fla requires; 2.8.0 pins triton 3.4.0 and compiles sm_86 with ptxas 12.8. 'torch' takes the newest wheel in the index."
-        required: false
-        default: "torch==2.7.1"
+        default: "pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime"
 
 permissions:
   contents: read
@@ -32,8 +29,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # torch's CUDA wheels carry their own CUDA user space (cudart, cuBLAS, cuDNN, NCCL, nvrtc) and a hosted
-      # runner has roughly 14 GB free, which the venv plus the saved tar will not fit in.
+      # The pytorch base carries a whole CUDA 12.6 runtime and a conda environment (~9 GB unpacked), and
+      # `docker save` writes all of that out again before gzip sees it. A hosted runner has roughly 14 GB free,
+      # which the build cache plus the saved tar would not fit in.
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
         with:
@@ -49,36 +47,38 @@ jobs:
         id: meta
         env:
           IN_UPSTREAM_REF: ${{ inputs.upstream_ref }}
-          IN_TORCH_INDEX: ${{ inputs.torch_index }}
-          IN_TORCH_SPEC: ${{ inputs.torch_spec }}
+          IN_PYTORCH_IMAGE: ${{ inputs.pytorch_image }}
         run: |
           set -euo pipefail
           ref="${IN_UPSTREAM_REF:-main}"
-          torch_index="${IN_TORCH_INDEX:-https://download.pytorch.org/whl/cu126}"
-          torch_spec="${IN_TORCH_SPEC:-torch==2.7.1}"
-          # An input is refused rather than escaped: none of the three can contain a space, a quote or a newline.
+          base_image="${IN_PYTORCH_IMAGE:-pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime}"
+          # An input is refused rather than escaped: neither can contain a space, a quote or a newline.
           printf '%s' "$ref" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]*$' \
             || { echo "refusing upstream_ref '$ref'" >&2; exit 1; }
-          printf '%s' "$torch_index" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9:/.+_-]*$' \
-            || { echo "refusing torch_index '$torch_index'" >&2; exit 1; }
-          printf '%s' "$torch_spec" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._=<>!~+,*-]*$' \
-            || { echo "refusing torch_spec '$torch_spec'" >&2; exit 1; }
-          # The index's last path segment names the wheel flavour in the tag: .../whl/cu124 -> cu124, .../whl/cpu
-          # -> cpu. A docker tag only takes [A-Za-z0-9._-], so anything else is refused rather than mangled.
-          flavour="$(printf '%s' "$torch_index" | sed 's:/*$::; s:.*/::')"
-          printf '%s' "$flavour" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' \
-            || { echo "the last segment of torch_index '$torch_index' is not usable in a tag: '$flavour'" >&2; exit 1; }
+          printf '%s' "$base_image" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/:@-]*$' \
+            || { echo "refusing pytorch_image '$base_image'" >&2; exit 1; }
+          # The base tag names the torch/CUDA pair in the artifact name:
+          # pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime -> 2.7.1-cuda12.6-cudnn9-runtime. A registry port sits
+          # before the last slash, so only the segment after it is examined; no tag there means 'latest' (a
+          # digest-pinned base lands on its own hex, which is unique and still a legal tag component). A docker
+          # tag only takes [A-Za-z0-9._-], so anything else is refused rather than mangled.
+          last="${base_image##*/}"
+          case "$last" in
+            *:*) base_tag="${last#*:}" ;;
+            *)   base_tag="latest" ;;
+          esac
+          printf '%s' "$base_tag" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' \
+            || { echo "cannot derive a tag component from pytorch_image '$base_image' (got '$base_tag')" >&2; exit 1; }
           # A tag is 128 characters at most and a ref can be longer.
           slug="$(printf '%s' "$ref" | tr -cs 'A-Za-z0-9._-' '-' | cut -c1-40 | sed 's/^-*//; s/-*$//')"
           [ -n "$slug" ] || slug=ref
           image=decider-torch
-          tag="${flavour}-${slug}"
+          tag="${base_tag}-${slug}"
           name="${image}-${tag}-amd64"
           {
             echo "ref=$ref"
-            echo "torch_index=$torch_index"
-            echo "torch_spec=$torch_spec"
-            echo "flavour=$flavour"
+            echo "base_image=$base_image"
+            echo "base_tag=$base_tag"
             echo "image=$image"
             echo "tag=$tag"
             echo "name=$name"
@@ -87,8 +87,7 @@ jobs:
             echo "IMAGE_REF=$image:$tag"
             echo "ARTIFACT_NAME=$name"
             echo "UPSTREAM_REF=$ref"
-            echo "TORCH_INDEX=$torch_index"
-            echo "TORCH_SPEC=$torch_spec"
+            echo "PYTORCH_IMAGE=$base_image"
           } >> "$GITHUB_ENV"
           echo "### decider-torch : \`$image:$tag\`" >> "$GITHUB_STEP_SUMMARY"
 
@@ -103,9 +102,8 @@ jobs:
           load: true
           tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
           build-args: |
+            PYTORCH_IMAGE=${{ steps.meta.outputs.base_image }}
             DECIDER_REF=${{ steps.meta.outputs.ref }}
-            TORCH_INDEX=${{ steps.meta.outputs.torch_index }}
-            TORCH_SPEC=${{ steps.meta.outputs.torch_spec }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -124,6 +122,7 @@ jobs:
           set -euo pipefail
           if command -v pigz >/dev/null 2>&1; then comp=pigz; else comp=gzip; fi
           echo "compressing with $comp"
+          df -h "${RUNNER_TEMP}" || true
           docker save "$IMAGE_REF" | "$comp" > "${RUNNER_TEMP}/${ARTIFACT_NAME}.tar.gz"
           cd "${RUNNER_TEMP}"
           # Only the file name goes in the checksum file, so `sha256sum -c` works in the download directory.
@@ -139,11 +138,9 @@ jobs:
             echo "image_id:         $(docker image inspect --format '{{.Id}}' "$IMAGE_REF")"
             echo "image_size_bytes: $(docker image inspect --format '{{.Size}}' "$IMAGE_REF")"
             echo "platform:         linux/amd64"
-            echo "base:             python:3.12-slim-bookworm"
+            echo "base:             ${PYTORCH_IMAGE}"
             echo "engine:           decider.serve on decider.engine_v2.EngineV2 (torch)"
             echo "upstream:         https://github.com/Mapika/decider @ ${UPSTREAM_REF}"
-            echo "torch_index:      ${TORCH_INDEX}"
-            echo "torch_spec:       ${TORCH_SPEC}"
             echo "tar_gz:           ${ARTIFACT_NAME}.tar.gz"
             echo "tar_gz_bytes:     $(stat -c %s "${ARTIFACT_NAME}.tar.gz")"
             echo "tar_gz_sha256:    $(cut -d' ' -f1 "${ARTIFACT_NAME}.tar.gz.sha256")"
@@ -178,7 +175,7 @@ jobs:
             echo "| image | \`$IMAGE_REF\` |"
             echo "| artifact | \`$ARTIFACT_NAME\` (tar.gz + .sha256 + .manifest.txt) |"
             echo "| upstream | \`https://github.com/Mapika/decider @ ${UPSTREAM_REF}\` |"
-            echo "| base | \`python:3.12-slim-bookworm\` + \`${TORCH_INDEX}\` |"
+            echo "| base | \`${PYTORCH_IMAGE}\` |"
             echo "| weights | not included -- mount the checkpoint |"
             echo ""
             echo "Load on the host (\`--gpus all\`, and a driver that allows CUDA 12.x -- >= 525; the 550.90.12 host qualifies), then:"

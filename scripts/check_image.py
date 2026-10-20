@@ -57,6 +57,18 @@ def _subprocess_python(code):
     return r.stdout.strip()
 
 
+def check_python_is_supported():
+    """Python comes from the base image's conda environment now, not from a python:3.x-slim tag this file picked,
+    so its version is a property of PYTORCH_IMAGE.  decider-ai declares requires-python >= 3.11, and the
+    causal_conv1d wheel name is derived from this same version: too old and pip refuses only after the
+    gigabytes of downloading that precede it."""
+    v = sys.version_info
+    assert (v.major, v.minor) >= (3, 11), (
+        f"python {v.major}.{v.minor} is below decider-ai's requires-python (>= 3.11); take a base image that "
+        f"ships a newer python")
+    return f"python {v.major}.{v.minor}.{v.micro} (from the base image)"
+
+
 def check_torch_is_the_cuda_build():
     import torch
     cuda = torch.version.cuda or ""
@@ -78,7 +90,13 @@ def check_cuda_libraries_resolve():
     purelib = sysconfig.get_paths()["purelib"]
     libs = sorted(glob.glob(purelib + "/torch/lib/*.so*") + glob.glob(purelib + "/nvidia/*/lib/*.so*"))
     assert libs, f"no torch shared libraries under {purelib} -- is torch installed at all?"
-    env = dict(os.environ, LD_LIBRARY_PATH=":".join(sorted({os.path.dirname(x) for x in libs})))
+    # Prepended to, not a replacement for, the image's own LD_LIBRARY_PATH: the pytorch base ships a system
+    # CUDA 12.6 and points at it, and its torch may take some libraries from there rather than from torch/lib.
+    # Overwriting the variable would report those as unresolvable -- a failure invented by the check.
+    search = ":".join(sorted({os.path.dirname(x) for x in libs}))
+    if os.environ.get("LD_LIBRARY_PATH"):
+        search = search + ":" + os.environ["LD_LIBRARY_PATH"]
+    env = dict(os.environ, LD_LIBRARY_PATH=search)
     out = subprocess.run(["ldd", *libs], capture_output=True, text=True, env=env).stdout
     missing = sorted({line.split()[0] for line in out.splitlines() if "not found" in line})
     bad = [m for m in missing if not (m in DRIVER_LIBS or m.startswith("libnvidia"))]
@@ -256,6 +274,7 @@ def check_caches_point_where_we_set_them():
 
 
 CHECKS = (
+    ("python from the base", check_python_is_supported),
     ("torch is a CUDA 12 build", check_torch_is_the_cuda_build),
     ("cuda libraries resolve", check_cuda_libraries_resolve),
     ("decider.serve routes", check_server_imports_with_every_route),
