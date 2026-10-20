@@ -1,8 +1,9 @@
 # decider-torch
 
 把 [Mapika/decider](https://github.com/Mapika/decider) 的 **torch 引擎**部署路径打成 Docker 镜像。
-基础镜像是 **`pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime`**——torch 2.7.1 / CUDA 12.6 / cuDNN 9 /
-triton 3.3.1 与 Python 都来自它，本镜像**自己不再装 torch**。**镜像不含权重**。
+decider 本身是 **PyPI 上的 `decider-ai` 发布轮子**（版本由 `DECIDER_VERSION` 钉死），基础镜像是
+**`pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime`**——torch 2.7.1 / CUDA 12.6 / cuDNN 9 / triton 3.3.1 与
+Python 都来自它，本镜像**自己不再装 torch**。**镜像不含权重**。
 
 镜像里跑的是**上游自己的服务器** `decider.serve:app`，不是本仓库重写的实现：
 
@@ -16,7 +17,7 @@ triton 3.3.1 与 Python 都来自它，本镜像**自己不再装 torch**。**�
 
 | | |
 |---|---|
-| 有 | 上游源码 @ `DECIDER_REF`，按 `decider-ai[serve]` 安装（`fastapi` / `uvicorn[standard]` / `httpx`） |
+| 有 | **`decider-ai` 1.9.0**（PyPI 发布轮子，`pip install "decider-ai[serve]==1.9.0"`；`serve` extra 带 `fastapi` / `uvicorn[standard]` / `httpx`）。**不是从源码装**，见下节 |
 | 有 | **torch 2.7.1 + CUDA 12.6 + cuDNN 9**：来自基础镜像 `pytorch/pytorch`，**不是 pip 装的**，含整套 CUDA 用户态（cudart / cuBLAS / cuDNN / NCCL / nvrtc） |
 | 有 | `triton 3.3.1`（基础镜像） + `flash-linear-attention`（pip）—— Qwen3.5 混合层的 Gated DeltaNet 靠它 |
 | 有 | `causal_conv1d 1.7.0`（预编译轮子，按 torch/cpython/ABI 匹配）—— 少了它 transformers 会退回参考实现 |
@@ -35,11 +36,22 @@ docker build -t decider-torch:cu126 .
 | build arg | 默认 | 说明 |
 |---|---|---|
 | `PYTORCH_IMAGE` | `pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime` | 基础镜像，**tag 里同时钉住 torch / CUDA 次版本 / cuDNN**。换它就等于换这三样：`2.8.0-cuda12.8-cudnn9-runtime` 会给 triton 3.4.0 + ptxas 12.8 |
-| `DECIDER_REF` | `main` | 上游分支 / tag / commit SHA。镜像内用 `curl` 取 tarball 解包，不装 git |
+| `DECIDER_VERSION` | `1.9.0` | decider-ai 的**确切发布版本**（PyPI）。写成 `==`，不接受范围——镜像要能只凭这个值复现，`check_image.py` 拿装上的 dist 版本与它逐字比对 |
 | `CCV_VERSION` / `CCV_TAG` | `1.7.0` / `v1.7.0` | causal_conv1d 的版本与 GitHub release tag |
-| `DECIDER_REPO` | `https://github.com/Mapika/decider` | fork 的话改这里 |
 
-构建 = 拉基础镜像 + 取上游 tarball + 两次 pip 安装，**没有任何编译**。对比上一版 GGUF 方案：那一版光 `llama-cpp-python` 源码编译就 703 秒，且必须两阶段（devel 编译 → runtime 运行）。
+构建 = 拉基础镜像 + **两次 pip 安装**（`decider-ai` 轮子 + `causal_conv1d` 轮子），没有 apt、没有编译器，整个 Dockerfile 只有 4 个 `RUN`。对比上一版 GGUF 方案：那一版光 `llama-cpp-python` 源码编译就 703 秒，且必须两阶段（devel 编译 → runtime 运行）。
+
+## 为什么装 PyPI 上的 `decider-ai`，而不是从源码装
+
+上游的发布轮子是 `py3-none-any`（纯 Python），`decider/serve.py`、`decider/engine_v2.py`、`decider/batching.py` 全在里面——仓库比轮子多出来的只有 `scripts/` 和 `docs/`，而启动脚本本仓库自己就有一份。所以「`curl` 取 tarball 再 `pip install /opt/decider`」这条路买到的是零，代价却有几样：一个可能 404 的 URL、一个会移动的 `main`、一份需要与轮子对齐的源码副本，以及镜像是哪一版 decider **说不出来**。
+
+改成 `pip install "decider-ai[serve]==${DECIDER_VERSION}"` 之后：
+
+- 镜像的 decider 版本由**一个字符串**决定，可复现，也写进 `org.opencontainers.image.version` 与 CI 产物名；
+- `check_image.py` 拿 `importlib.metadata.version("decider-ai")` 与 `DECIDER_VERSION` **逐字比对**——不是「pip 说装好了」，而是「装上的就是声明的那一版」；
+- 镜像里不再需要 `curl` 和 `git`（两者都删了），基础层少一步网络。
+
+代价说清楚：`main` 上的新东西要等上游发版才有。要跑未发布的分支，把 `DECIDER_VERSION` 换成一个自己 build 的 wheel 或改回源码安装——但那样产物名就不能只靠版本号标识了。
 
 ## 为什么基础镜像是 pytorch/pytorch
 
@@ -49,13 +61,13 @@ docker build -t decider-torch:cu126 .
 
 三个落地细节：
 
-- **不装 torch，并当场检查它没被换掉**。`decider-ai` 声明的是裸 `torch`，pip 会认为已装即满足；Dockerfile 在 `pip install "/opt/decider[serve]"` 前后各读一次 `torch.__version__`，不一致就直接失败——否则「torch 来自基础镜像」只是期望，而不是事实。
+- **不装 torch，并当场检查它没被换掉**。`decider-ai` 声明的是裸 `torch`，pip 会认为已装即满足；Dockerfile 在 `pip install "decider-ai[serve]==$DECIDER_VERSION"` 前后各读一次 `torch.__version__`，不一致就直接失败——否则「torch 来自基础镜像」只是期望，而不是事实。
 - **`-runtime` 而不是 `-devel`**：这里不编译任何 CUDA 扩展。`causal_conv1d` 是预编译轮子，fla 的 kernel 由 triton 在运行时 JIT，而 triton 自带 ptxas。devel 只是白白多背一套 nvcc。
 - **基础镜像先报一遍身份**：`torch <版本> cuda <版本> python <版本>`，且不是 CUDA 构建就在那一步停住，而不是等两 GB 的 pip 装完再由 `check_image.py` 报告。
 
 代价说清楚：镜像比 slim + 轮子那版**大几 GB**（基础镜像含完整 CUDA 运行时和 conda 环境），Python 也不再由本仓库挑——它来自镜像的 conda base，上游只要求 `requires-python>=3.11`，够用；但 Python 版本直接决定 `causal_conv1d` 的轮子名（`cp311`/`cp312`），所以 Dockerfile 现场推导，`check_image.py` 再断言它 ≥3.11。
 
-顺带，这套结构正好对应「AI 镜像三条常识」的另外两条：依赖用包管理器声明式装（这里是 `pip install "/opt/decider[serve]"`，上游没有 lockfile），权重一律走卷、不进镜像（`/hf-cache`，以及 `/triton-cache`）。
+顺带，这套结构正好对应「AI 镜像三条常识」的另外两条：依赖用包管理器声明式装（这里是 `pip install "decider-ai[serve]==$DECIDER_VERSION"`，版本由一个 pin 定死），权重一律走卷、不进镜像（`/hf-cache`，以及 `/triton-cache`）。
 
 ## 版本为什么这么选（驱动 550.90.12 / A40）
 
@@ -64,15 +76,19 @@ docker build -t decider-torch:cu126 .
 > CUDA 12.x 是 minor-version compatible —— 用任意 12.x toolkit 编译的应用，都能跑在 **≥525** 的驱动上（上限到 580）。
 > 所以 550 上跑 cu126 是**官方允许**的；CUDA 13 才需要 ≥580。
 
-真正卡住的是 **triton**：
+真正卡住的是 **triton**，**另外 `causal_conv1d` 的预编译轮子卡住上限**。下表如实测的 wheel 元数据（`torch` 的 `requires_dist` 里钉的 `triton==` 与 `nvidia-*-cu12`）：
 
-| torch | triton | 非 Blackwell 的 ptxas | 与 fla 0.5.2 的关系 |
-|---|---|---|---|
-| 2.6.0（cu124 天花板） | 3.2.0 | 12.4.99 | ❌ 低于 fla 要求的 **3.3** |
-| **2.7.1（本镜像；基础镜像 `...-cuda12.6-cudnn9-runtime`）** | **3.3.1** | **12.4.99** | ✅ 刚好过线 |
-| 2.8.0（`...-cuda12.8-cudnn9-runtime`） | 3.4.0 | 12.8.93 | ✅ 有余量，但 sm_86 的 codegen 变了 |
+| torch | triton | cudart / cuDNN | 非 Blackwell 的 ptxas | `causal_conv1d 1.7.0` 轮子 | 与 fla 门槛 |
+|---|---|---|---|---|---|
+| 2.6.0（cu124 天花板） | 3.2.0 | 12.4 / — | 12.4.99 | `cu12torch2.6` | ❌ 低于 **3.3** |
+| **2.7.1（本镜像，`...-cuda12.6-cudnn9-runtime`）** | **3.3.1** | **12.6.77 / 9.5.1** | **12.4.99** | **`cu12torch2.7` ✅** | ✅ 刚好过线 |
+| 2.8.0（`...-cuda12.8-cudnn9-runtime`） | 3.4.0 | 12.8.90 / 9.10.2 | 12.8.93 | `cu12torch2.8` ✅ | ✅ 有余量，但 sm_86 的 codegen 变了 |
+| 2.9.x / 2.10.0（cu128） | 3.5.x / 3.6.0 | 12.8.90 / 9.10.2 | 12.8.93 | ❓ 未见对应轮子 | ✅ 但落地先卡在卷积轮子上 |
+| 2.14.x | 3.8 | **cu13** | — | ❌ | ❌ 需要驱动 ≥580，550 上跑不了 |
 
-选 2.7.1 的关键理由在第三列：**triton 3.3 给 sm_86 用的 ptxas 是 12.4.99，和 3.2.0 完全相同**（3.3 的 `cmake/nvidia-toolchain-version.json` 里 `ptxas: 12.4.99`，12.8 的那个只给 Blackwell）。也就是说编译出来的 kernel 一位没变，**只是满足了 fla 的版本门槛**——数值上不引入新变量。cu128 那条（ptxas 12.8）能用，但没有收益。
+选 2.7.1 的关键理由在 ptxas 那一列：**triton 3.3 给 sm_86 用的 ptxas 是 12.4.99，和 3.2.0 完全相同**（3.3 的 `cmake/nvidia-toolchain-version.json` 里 `ptxas: 12.4.99`，12.8 的那个只给 Blackwell）。也就是说编译出来的 kernel 一位没变，**只是满足了 fla 的版本门槛**——数值上不引入新变量。2.8.0 能用（也能跑在 550 上，CUDA 12.x 是 minor-version compatible），但没有收益，代价是把 sm_86 的 codegen 挪到 ptxas 12.8。
+
+换成 `pip install decider-ai` 之后，这个判断**没有被推翻，只是变得更重要**：`decider-ai` 声明的 torch 是裸的，而 fla 的两条门槛（`torch>=2.7`、`triton>=3.3`）写在 **`fla-core[cuda]` 这个 extra 里**——我们装的是裸 `fla`，所以 **pip 根本不会校验它们**。torch 的唯一来源就是基础镜像，所以这两条由 `check_image.py` 断言（第 6、7 项），而不是指望依赖求解器。也正因为 2.7.1 刚好压在两条地板上，将来 fla 抬高任意一条，构建会**当场失败**并提示下一个可用 tag，而不是上机后静默降级。
 
 为什么这条门槛必须过？因为 fla 在版本不足时**只 warning、不报错**，而紧随其后的平台探测会把失败也吞掉：
 
@@ -179,42 +195,41 @@ curl -s localhost:8000/v1/models
 
 保住 `B=1` 的全部 `T`（长行只能靠它），砍掉大 batch 那半边。完全没有 `DECIDER_GRAPHS` 这个环境变量——关图只有 `DECIDER_WARMUP=0`（`use_graphs` 只看 device 是否为 cuda）；关掉后 `logits_all` 走 eager，`max_rows` 回落到 `token_budget // T`，慢但不崩。
 
-## 上游自己的 serve.sh 也在镜像里
+## 入口脚本是本仓库的
 
-路径 `/opt/decider/scripts/serve.sh`。它默认 `DECIDER_HOST=127.0.0.1` 和 `UVICORN=.venv312/bin/uvicorn` —— 前者在容器里穿不过 published port（表现像端口映射挂了），后者只在上游自己的 `uv venv` 开发环境里存在。本镜像把这两个都预设了（`DECIDER_HOST=0.0.0.0`、`UVICORN=uvicorn`），所以它**一个字不改就能直接用**：
+发布轮子里没有 `scripts/`，所以镜像的入口是 `scripts/serve.sh`（装在 `/app/scripts/`，`WORKDIR` 是 `/app`）。它干的事和上游仓库里那个脚本一样（`exec uvicorn decider.serve:app`），差别有三处：
 
-```bash
-docker run --rm --gpus all -p 8000:8000 -v decider-hf:/hf-cache \
-  decider-torch:cu126 /opt/decider/scripts/serve.sh Mapika/decider-2b 8000
-```
-
-本仓库的 `scripts/serve.sh` 与它的差别只有三处：自己写死 `0.0.0.0` 默认值（不依赖 ENV）、加一层 `decider_config.json` 预检、挡掉 `.gguf` 参数。
+- **默认 `DECIDER_HOST=0.0.0.0`**：上游默认 `127.0.0.1` 在容器里穿不过 published port，表现像端口映射挂了；`UVICORN` 也预设成 `uvicorn`，因为上游默认的 `.venv312/bin/uvicorn` 只在它自己的 `uv venv` 开发环境里存在。
+- 加一层 `decider_config.json` 预检。
+- 挡掉 `.gguf` 参数（torch 引擎读不了，见下）。
 
 预检解决的是一个真实的静默失败：`decider.serve` 读 `decider_config.json`（layout、temperature、`temperature_by_type`、`schema_first`）时用的是 `try/except` 全吞，仓库里没有这个文件就按 **temperature 1.0 + plain layout** 跑，而且一个字都不说。对 decider 模型这是错的；对「stock checkpoint + `DECIDER_LAYOUT=chat`」则是正常的。所以它只大声告警、不阻断启动。想关掉：`DECIDER_CONFIG_CHECK=0`。
 
 ## CI：构建并上传为 artifact
 
-`.github/workflows/docker-build-artifact.yml`，只 `workflow_dispatch`，输入 `upstream_ref` 与 `pytorch_image`（基础镜像，含 tag）。产物是 `decider-torch-<base tag>-<ref>-amd64.tar.gz` + `.sha256` + `.manifest.txt`，**不推任何 registry**。默认组合下就是 `decider-torch-2.7.1-cuda12.6-cudnn9-runtime-main-amd64`。
+`.github/workflows/docker-build-artifact.yml`，只 `workflow_dispatch`，输入 `decider_version`（PyPI 上的确切发布版本）与 `pytorch_image`（基础镜像，含 tag）。产物是 `decider-torch-<base tag>-<版本>-amd64.tar.gz` + `.sha256` + `.manifest.txt`，**不推任何 registry**。默认组合下就是 `decider-torch-2.7.1-cuda12.6-cudnn9-runtime-1.9.0-amd64`。
 
 ```bash
 sha256sum -c decider-torch-*.tar.gz.sha256
 gzip -dc decider-torch-*.tar.gz | docker load
 ```
 
-镜像契约由 `scripts/check_image.py` 定义，**构建期和 CI smoke test 跑的是同一个文件**，两边不会漂。12 项检查（全部不需要 GPU）：
+镜像契约由 `scripts/check_image.py` 定义，**构建期和 CI smoke test 跑的是同一个文件**，两边不会漂。14 项检查（全部不需要 GPU）：
 
 1. **Python ≥3.11** —— 版本现在由基础镜像决定（不是本仓库挑的），而 `decider-ai` 的 `requires-python` 和 `causal_conv1d` 的轮子名（`cp311`/`cp312`）都取决于它
 2. torch 是 **CUDA 12.x** 构建，且轮子 tag 与 `torch.version.cuda` 一致 —— 装成 CPU 轮子会让整个引擎静默跑在 CPU 上；装成 cu13x 则超出驱动能力
-3. torch 的 CUDA 动态依赖在镜像内全部可解析，只允许宿主驱动那几个缺失（按精确名白名单，`libcuda*` 前缀会把 `libcudart.so.12` 一起放行）。`ldd` 的搜索路径是**在镜像自己的 `LD_LIBRARY_PATH` 前面追加** torch 的库目录，不是替换——基础镜像自带系统 CUDA 12.6，替换会把它变成「检查自己造出来的缺库」
+3. torch 的 CUDA 动态依赖在镜像内全部可解析，只允许宿主驱动那几个缺失（按精确名白名单，`libcuda*` 前缀会把 `libcudart.so.12` 一起放行）。`ldd` 的搜索路径是**在镜像自己的 `LD_LIBRARY_PATH` 前面追加** torch 的库目录，不是替换——基础镜像自带系统 CUDA 12.6，替换会把它变成「检查自己造出来的缺库」。顺带这一项也是 `libgomp1` 的兜底：镜像里不再 `apt-get install` 任何东西，缺了它这里会报 `libgomp.so.1: not found`
 4. `decider.serve` 可导入且五条路由齐全
-5. `triton` + `fla` 在位
-6. **`triton` 版本 ≥ fla 自己声明的门槛** —— 门槛从 `fla.utils._device.check_environments` 的源码里读，读不到才回落到文档里的 `3.3.0`。这一项是拿真实 GPU 失败换来的：`find_spec("fla")` 全绿、镜像上机第一次前向就退回 O(N²) 参考实现的正是它
-7. **`causal_conv1d` 真的能 import**，不是只装上了（同一个坑：装了 ≠ 能用）
-8. `transformers>=5`
-9. `scripts/serve.sh` 存在、可执行、bash 语法干净、确实启动 `decider.serve:app`
-10. `/hf-cache` 与 `/triton-cache` 可写
-11. 两个缓存**确实落在上面那两个路径** —— 问 `FileCacheManager` 自己刚建出来的目录在哪、问 `huggingface_hub.constants.HF_HUB_CACHE` 在哪，而不是回读环境变量（回读是循环论证：库不认这个变量也照样通过）。⚠️ 不能拿 triton 的 `default_cache_dir()` 当答案——3.2/3.3 里它**只是 fallback、恒返回 `~/.triton/cache`**，跟环境变量无关，第一版检查就栽在这（构建期假红）
-12. 没有把权重打进镜像
+5. **装上的 `decider-ai` 就是 `DECIDER_VERSION` 声明的那一版** —— 逐字比对 dist 元数据，防的是「pip 装了个别的版本」和「镜像说不出自己跑的是哪版」
+6. `triton` + `fla` 在位
+7. **`triton` 版本 ≥ fla 自己声明的门槛** —— 门槛从 `fla.utils._device.check_environments` 的源码里读，读不到才回落到文档里的 `3.3.0`。这一项是拿真实 GPU 失败换来的：`find_spec("fla")` 全绿、镜像上机第一次前向就退回 O(N²) 参考实现的正是它
+8. **`torch` 版本 ≥ fla 自己声明的门槛** —— 从 `fla-core` 的 dist 元数据（`torch>=2.7`）里读。这条门槛写在 `fla-core[cuda]` 这个 extra 里，而我们装的是裸 `fla`，**pip 永远不会校验它**；torch 又只来自基础镜像，所以只能在这里断言
+9. **`causal_conv1d` 真的能 import**，不是只装上了（同一个坑：装了 ≠ 能用）
+10. `transformers>=5`，并把 `transformers` / `flash-linear-attention` 的实际版本打出来（这两个是 `decider-ai` 下面**没有 pin** 的依赖，重建一次就可能变）
+11. `scripts/serve.sh` 存在、可执行、bash 语法干净、确实启动 `decider.serve:app`
+12. `/hf-cache` 与 `/triton-cache` 可写
+13. 两个缓存**确实落在上面那两个路径** —— 问 `FileCacheManager` 自己刚建出来的目录在哪、问 `huggingface_hub.constants.HF_HUB_CACHE` 在哪，而不是回读环境变量（回读是循环论证：库不认这个变量也照样通过）。⚠️ 不能拿 triton 的 `default_cache_dir()` 当答案——3.2/3.3 里它**只是 fallback、恒返回 `~/.triton/cache`**，跟环境变量无关，第一版检查就栽在这（构建期假红）
+14. 没有把权重打进镜像
 
 单跑：
 

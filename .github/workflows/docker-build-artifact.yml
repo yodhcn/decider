@@ -1,19 +1,19 @@
 name: docker-build-artifact
 
 # Builds the image (decider.serve on decider.engine_v2.EngineV2) on top of pytorch/pytorch -- torch 2.7.1,
-# CUDA 12.6, cuDNN 9, triton 3.3.1 -- and uploads it as a workflow artifact (`docker save | gzip`). Nothing is
-# pushed to a registry: download the artifact from the run page and
-# `gzip -dc decider-torch-*.tar.gz | docker load`.
+# CUDA 12.6, cuDNN 9, triton 3.3.1 -- and uploads it as a workflow artifact (`docker save | gzip`). decider
+# itself is the released wheel from PyPI, pinned to one version. Nothing is pushed to a registry: download the
+# artifact from the run page and `gzip -dc decider-torch-*.tar.gz | docker load`.
 #
 # Manual only -- a multi-GB artifact does not belong on every push.
 
 on:
   workflow_dispatch:
     inputs:
-      upstream_ref:
-        description: "Mapika/decider git ref: branch, tag or commit SHA"
+      decider_version:
+        description: "decider-ai release from PyPI, exact (e.g. 1.9.0). Installed as decider-ai[serve]==<version> and checked against the installed distribution; it becomes part of the artifact name."
         required: false
-        default: "main"
+        default: "1.9.0"
       pytorch_image:
         description: "Base image, tag included. torch, triton and the CUDA user space come from it and are never pip-installed. Default 2.7.1-cuda12.6-cudnn9-runtime: cu126 because CUDA 12.x is minor-version compatible (the 550 driver runs it) and because torch 2.7.1 pins triton 3.3.1, the floor flash-linear-attention declares. Its tag becomes part of the artifact name."
         required: false
@@ -46,15 +46,17 @@ jobs:
       - name: Image metadata
         id: meta
         env:
-          IN_UPSTREAM_REF: ${{ inputs.upstream_ref }}
+          IN_DECIDER_VERSION: ${{ inputs.decider_version }}
           IN_PYTORCH_IMAGE: ${{ inputs.pytorch_image }}
         run: |
           set -euo pipefail
-          ref="${IN_UPSTREAM_REF:-main}"
+          version="${IN_DECIDER_VERSION:-1.9.0}"
           base_image="${IN_PYTORCH_IMAGE:-pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime}"
-          # An input is refused rather than escaped: neither can contain a space, a quote or a newline.
-          printf '%s' "$ref" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]*$' \
-            || { echo "refusing upstream_ref '$ref'" >&2; exit 1; }
+          # An input is refused rather than escaped: neither can contain a space, a quote or a newline.  The
+          # version has to be a plain PEP 440 release -- no operator, no range -- because the Dockerfile pins it
+          # with `==` and check_image.py compares the installed distribution against it verbatim.
+          printf '%s' "$version" | grep -Eq '^[0-9][0-9A-Za-z.!+_-]*$' \
+            || { echo "refusing decider_version '$version' (an exact release, e.g. 1.9.0)" >&2; exit 1; }
           printf '%s' "$base_image" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/:@-]*$' \
             || { echo "refusing pytorch_image '$base_image'" >&2; exit 1; }
           # The base tag names the torch/CUDA pair in the artifact name:
@@ -69,14 +71,14 @@ jobs:
           esac
           printf '%s' "$base_tag" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' \
             || { echo "cannot derive a tag component from pytorch_image '$base_image' (got '$base_tag')" >&2; exit 1; }
-          # A tag is 128 characters at most and a ref can be longer.
-          slug="$(printf '%s' "$ref" | tr -cs 'A-Za-z0-9._-' '-' | cut -c1-40 | sed 's/^-*//; s/-*$//')"
-          [ -n "$slug" ] || slug=ref
+          # A tag is 128 characters at most and a version plus the base tag can get long.
+          slug="$(printf '%s' "$version" | tr -cs 'A-Za-z0-9._-' '-' | cut -c1-40 | sed 's/^-*//; s/-*$//')"
+          [ -n "$slug" ] || slug=unversioned
           image=decider-torch
           tag="${base_tag}-${slug}"
           name="${image}-${tag}-amd64"
           {
-            echo "ref=$ref"
+            echo "version=$version"
             echo "base_image=$base_image"
             echo "base_tag=$base_tag"
             echo "image=$image"
@@ -86,7 +88,7 @@ jobs:
           {
             echo "IMAGE_REF=$image:$tag"
             echo "ARTIFACT_NAME=$name"
-            echo "UPSTREAM_REF=$ref"
+            echo "DECIDER_VERSION=$version"
             echo "PYTORCH_IMAGE=$base_image"
           } >> "$GITHUB_ENV"
           echo "### decider-torch : \`$image:$tag\`" >> "$GITHUB_STEP_SUMMARY"
@@ -103,7 +105,7 @@ jobs:
           tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
           build-args: |
             PYTORCH_IMAGE=${{ steps.meta.outputs.base_image }}
-            DECIDER_REF=${{ steps.meta.outputs.ref }}
+            DECIDER_VERSION=${{ steps.meta.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -140,7 +142,8 @@ jobs:
             echo "platform:         linux/amd64"
             echo "base:             ${PYTORCH_IMAGE}"
             echo "engine:           decider.serve on decider.engine_v2.EngineV2 (torch)"
-            echo "upstream:         https://github.com/Mapika/decider @ ${UPSTREAM_REF}"
+            echo "decider-ai:       ${DECIDER_VERSION} (PyPI: decider-ai[serve]==${DECIDER_VERSION})"
+            echo "upstream:         https://pypi.org/project/decider-ai/${DECIDER_VERSION}/"
             echo "tar_gz:           ${ARTIFACT_NAME}.tar.gz"
             echo "tar_gz_bytes:     $(stat -c %s "${ARTIFACT_NAME}.tar.gz")"
             echo "tar_gz_sha256:    $(cut -d' ' -f1 "${ARTIFACT_NAME}.tar.gz.sha256")"
@@ -163,7 +166,7 @@ jobs:
           # The tar is already gzip-compressed; compressing it again only burns CPU and upload time.
           compression-level: 0
           retention-days: 30
-          # v4 refuses a duplicate name; without this a manual re-run of the same ref fails outright.
+          # v4 refuses a duplicate name; without this a manual re-run of the same version fails outright.
           overwrite: true
 
       - name: Summary
@@ -174,7 +177,7 @@ jobs:
             echo "| --- | --- |"
             echo "| image | \`$IMAGE_REF\` |"
             echo "| artifact | \`$ARTIFACT_NAME\` (tar.gz + .sha256 + .manifest.txt) |"
-            echo "| upstream | \`https://github.com/Mapika/decider @ ${UPSTREAM_REF}\` |"
+            echo "| decider-ai | \`${DECIDER_VERSION}\` — \`pip install decider-ai[serve]==${DECIDER_VERSION}\` from PyPI |"
             echo "| base | \`${PYTORCH_IMAGE}\` |"
             echo "| weights | not included -- mount the checkpoint |"
             echo ""
