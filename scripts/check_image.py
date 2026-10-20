@@ -40,6 +40,16 @@ ROUTES = {"/decide", "/v1/systemone", "/health", "/v1/models", "/stats"}
 # prefix would also let libcudart.so.12 through, and that one is exactly what this check is for.
 DRIVER_LIBS = ("libcuda.so.1", "libnvcuvid.so.1")
 
+# Not an allow-list: these three must be present, and this maps them to the distro package that provides them so
+# the failure says what to install instead of only what is missing.  They are libnccl.so.2's DT_NEEDED entries
+# (NVIDIA links NCCL's InfiniBand transport in rather than dlopen-ing it), and they are the one thing a runtime
+# CUDA base does not ship.  A single GPU never uses that path, but libtorch_cuda.so will not load without them.
+IBVERBS_PACKAGES = {
+    "libibverbs.so.1": "libibverbs1",
+    "librdmacm.so.1": "librdmacm1",
+    "libmlx5.so.1": "ibverbs-providers",
+}
+
 
 def _vtuple(s):
     """`"3.3.1+gitabc"` -> `(3, 3, 1)`.  Comparing these beats importing packaging to compare three numbers."""
@@ -102,8 +112,13 @@ def check_cuda_libraries_resolve():
     out = subprocess.run(["ldd", *libs], capture_output=True, text=True, env=env).stdout
     missing = sorted({line.split()[0] for line in out.splitlines() if "not found" in line})
     bad = [m for m in missing if not (m in DRIVER_LIBS or m.startswith("libnvidia"))]
+    hint = ""
+    packages = sorted({IBVERBS_PACKAGES[m] for m in bad if m in IBVERBS_PACKAGES})
+    if packages:
+        hint = (f" -- apt packages {packages} provide those; libnccl.so.2 declares them as DT_NEEDED, so without "
+                f"them libtorch_cuda.so does not load and the engine silently runs on the CPU")
     assert not bad, (f"this image cannot resolve {bad}; the allowed-absent set is exactly "
-                     f"{list(DRIVER_LIBS)} plus libnvidia* (host driver)")
+                     f"{list(DRIVER_LIBS)} plus libnvidia* (host driver){hint}")
     return f"{len(libs)} libraries, driver-only absences: {missing or 'none'}"
 
 
@@ -149,19 +164,28 @@ def check_hybrid_layer_dependencies():
 
 
 def _fla_triton_floor():
-    """fla's minimum triton, read out of its source.
+    """fla's minimum triton, read out of its source file.
 
     It cannot be imported: `required_triton_version` is a local inside check_environments(), not a module
-    constant.  Falls back to MIN_TRITON if fla reorganises, because the check has to have a floor either way.
+    constant.  Importing the module to read it would be worse than useless anyway -- `fla/utils/_device.py` runs
+    `triton.runtime.driver.active.get_current_target()` at module scope, and on a build host with no GPU that
+    probe has nothing to return, so the act of asking would be the failure.  The same goes for
+    `find_spec("fla.utils._device")`: locating a *submodule* imports its parent packages first.  Walking sys.path
+    executes nothing, and the answer is a regex over four lines of text.
     """
-    try:
-        src = _subprocess_python(
-            "import inspect;from fla.utils import _device;print(inspect.getsource(_device.check_environments))")
-    except AssertionError:
-        return MIN_TRITON, f"fla floor unreadable, using the documented {MIN_TRITON}"
-    m = re.search(r"required_triton_version\s*=\s*package_version\.parse\([\"']([\d.]+)[\"']\)", src)
+    path = None
+    for entry in sys.path:
+        candidate = os.path.join(entry or os.getcwd(), "fla", "utils", "_device.py")
+        if os.path.isfile(candidate):
+            path = candidate
+            break
+    if path is None:
+        return MIN_TRITON, f"fla/utils/_device.py not on sys.path, using the documented {MIN_TRITON}"
+    src = open(path, encoding="utf-8", errors="replace").read()
+    m = re.search(r"required_triton_version\s*=\s*package_version\.parse\(\s*[\"']([0-9][0-9A-Za-z.]*)[\"']",
+                  src)
     if not m:
-        return MIN_TRITON, f"fla floor not found in its source, using the documented {MIN_TRITON}"
+        return MIN_TRITON, f"fla floor not found in {path}, using the documented {MIN_TRITON}"
     return m.group(1), None
 
 

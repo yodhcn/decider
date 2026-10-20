@@ -39,7 +39,19 @@ docker build -t decider-torch:cu126 .
 | `DECIDER_VERSION` | `1.9.0` | decider-ai 的**确切发布版本**（PyPI）。写成 `==`，不接受范围——镜像要能只凭这个值复现，`check_image.py` 拿装上的 dist 版本与它逐字比对 |
 | `CCV_VERSION` / `CCV_TAG` | `1.7.0` / `v1.7.0` | causal_conv1d 的版本与 GitHub release tag |
 
-构建 = 拉基础镜像 + **两次 pip 安装**（`decider-ai` 轮子 + `causal_conv1d` 轮子），没有 apt、没有编译器，整个 Dockerfile 只有 4 个 `RUN`。对比上一版 GGUF 方案：那一版光 `llama-cpp-python` 源码编译就 703 秒，且必须两阶段（devel 编译 → runtime 运行）。
+构建 = 拉基础镜像 + **一次 `apt-get install`**（三个 InfiniBand 运行时库，见下）+ **两次 pip 安装**（`decider-ai` 轮子 + `causal_conv1d` 轮子），没有编译器，整个 Dockerfile 只有 4 个 `RUN`。对比上一版 GGUF 方案：那一版光 `llama-cpp-python` 源码编译就 703 秒，且必须两阶段（devel 编译 → runtime 运行）。
+
+### 为什么 runtime 基础镜像还要装三个库
+
+`pytorch/pytorch:...-runtime` 装好的 `libnccl.so.2` 把 `libibverbs.so.1`、`librdmacm.so.1`、`libmlx5.so.1` 声明成了 **DT_NEEDED**——NVIDIA 编译 NCCL 时把 InfiniBand 传输**链进去**了，不是运行时 `dlopen`。这三个库是 `libtorch_cuda.so` 的传递依赖，缺了它**加载不了**。
+
+麻烦在于 torch 把这个加载推迟到第一次 CUDA 调用，所以症状不是 `ImportError`，而是 `torch.cuda.is_available()` 返回 `False`、引擎安静地跑在 CPU 上——正是这个镜像整套设计要避免的静默降级。单张 A40 永远走不到 IB 传输路径，但动态链接器不知道这件事。
+
+```dockerfile
+apt-get install -y --no-install-recommends libibverbs1 librdmacm1 ibverbs-providers
+```
+
+约 3 MB 运行时库，无编译器无头文件。`check_image.py` 的 ldd 扫描会带上这三个的名字，并且失败信息里直接写该装哪个包。
 
 ## 为什么装 PyPI 上的 `decider-ai`，而不是从源码装
 
@@ -218,11 +230,11 @@ gzip -dc decider-torch-*.tar.gz | docker load
 
 1. **Python ≥3.11** —— 版本现在由基础镜像决定（不是本仓库挑的），而 `decider-ai` 的 `requires-python` 和 `causal_conv1d` 的轮子名（`cp311`/`cp312`）都取决于它
 2. torch 是 **CUDA 12.x** 构建，且轮子 tag 与 `torch.version.cuda` 一致 —— 装成 CPU 轮子会让整个引擎静默跑在 CPU 上；装成 cu13x 则超出驱动能力
-3. torch 的 CUDA 动态依赖在镜像内全部可解析，只允许宿主驱动那几个缺失（按精确名白名单，`libcuda*` 前缀会把 `libcudart.so.12` 一起放行）。`ldd` 的搜索路径是**在镜像自己的 `LD_LIBRARY_PATH` 前面追加** torch 的库目录，不是替换——基础镜像自带系统 CUDA 12.6，替换会把它变成「检查自己造出来的缺库」。顺带这一项也是 `libgomp1` 的兜底：镜像里不再 `apt-get install` 任何东西，缺了它这里会报 `libgomp.so.1: not found`
+3. torch 的 CUDA 动态依赖在镜像内全部可解析，只允许宿主驱动那几个缺失（按精确名白名单，`libcuda*` 前缀会把 `libcudart.so.12` 一起放行）。`ldd` 的搜索路径是**在镜像自己的 `LD_LIBRARY_PATH` 前面追加** torch 的库目录，不是替换——基础镜像自带系统 CUDA 12.6，替换会把它变成「检查自己造出来的缺库」。这一项是构建期真正拦下过东西的那一项：NCCL 的三个 InfiniBand 库缺失在这里失败，而不是在 A40 上表现为 `torch.cuda.is_available() == False`。顺带它也是 `libgomp1` 的兜底——那个没装的话这里会报 `libgomp.so.1: not found`
 4. `decider.serve` 可导入且五条路由齐全
 5. **装上的 `decider-ai` 就是 `DECIDER_VERSION` 声明的那一版** —— 逐字比对 dist 元数据，防的是「pip 装了个别的版本」和「镜像说不出自己跑的是哪版」
 6. `triton` + `fla` 在位
-7. **`triton` 版本 ≥ fla 自己声明的门槛** —— 门槛从 `fla.utils._device.check_environments` 的源码里读，读不到才回落到文档里的 `3.3.0`。这一项是拿真实 GPU 失败换来的：`find_spec("fla")` 全绿、镜像上机第一次前向就退回 O(N²) 参考实现的正是它
+7. **`triton` 版本 ≥ fla 自己声明的门槛** —— 门槛从 `fla/utils/_device.py` 的**源码文本**里正则读（`required_triton_version = package_version.parse("3.3.0")`），读不到才回落到文档里的 `3.3.0`。这里刻意**不 import**：那个模块在 import 期就调 `triton.runtime.driver.active.get_current_target()`，构建机上没有 GPU，探测本身就会失败——连 `find_spec("fla.utils._device")` 都不行，因为查找子模块会先导入父包。第一版用 `inspect.getsource` 就栽在这，构建日志里只留下 `fla floor unreadable`（检查降级了，但降级得很安静）。这一项本身是拿真实 GPU 失败换来的：`find_spec("fla")` 全绿、镜像上机第一次前向就退回 O(N²) 参考实现的正是它
 8. **`torch` 版本 ≥ fla 自己声明的门槛** —— 从 `fla-core` 的 dist 元数据（`torch>=2.7`）里读。这条门槛写在 `fla-core[cuda]` 这个 extra 里，而我们装的是裸 `fla`，**pip 永远不会校验它**；torch 又只来自基础镜像，所以只能在这里断言
 9. **`causal_conv1d` 真的能 import**，不是只装上了（同一个坑：装了 ≠ 能用）
 10. `transformers>=5`，并把 `transformers` / `flash-linear-attention` 的实际版本打出来（这两个是 `decider-ai` 下面**没有 pin** 的依赖，重建一次就可能变）

@@ -126,12 +126,27 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 # defines no DECIDER_VERSION, so this cannot collide with a runtime knob.
 ENV DECIDER_VERSION=${DECIDER_VERSION}
 
-# No apt step.  Everything it used to install is already in the base or is checked one line later: the ubuntu /
-# CUDA base that pip's TLS runs on carries ca-certificates (and curl, which this Dockerfile no longer needs),
-# and libgomp1 is torch's OpenMP runtime, which the `import torch` below resolves before pip runs at all.  If a
-# future base drops either, that import fails here with the library's name -- and check_image.py's ldd sweep
-# would fail on `libgomp.so.1: not found` rather than letting the first forward on the GPU discover it.
-RUN mkdir -p "${HF_HOME}" "${TRITON_CACHE_DIR}" /models
+# One apt step, and it is not optional.  torch's libnccl.so.2 lists libibverbs.so.1, librdmacm.so.1 and
+# libmlx5.so.1 as DT_NEEDED -- NVIDIA links NCCL's InfiniBand transport in rather than dlopen-ing it -- so
+# libtorch_cuda.so cannot be loaded without them.  torch defers that load until the first CUDA call, and the
+# symptom is not an ImportError: it is torch.cuda.is_available() returning False and the engine quietly running
+# on the CPU, which is the exact silent downgrade this whole image is built to avoid.  A single A40 never touches
+# the IB transport; the dynamic linker cannot know that.  No compiler, no headers, no -dev packages: ~3 MB of
+# runtime libraries, and the apt lists are removed in the same layer.
+#
+# Everything else an apt step used to install is either already in the base or caught a line later: the ubuntu
+# base carries ca-certificates (and curl, which this Dockerfile no longer needs), and libgomp1 -- torch's OpenMP
+# runtime -- is resolved by the `import torch` below before pip runs at all.  If a future base drops either, that
+# import fails here with the library's name, and check_image.py's ldd sweep would fail on `libgomp.so.1: not
+# found` rather than letting the first forward on the GPU discover it.
+RUN set -eux; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      libibverbs1 \
+      librdmacm1 \
+      ibverbs-providers; \
+    rm -rf /var/lib/apt/lists/*; \
+    mkdir -p "${HF_HOME}" "${TRITON_CACHE_DIR}" /models
 
 # Two things, one layer: say what the base gave us, then install decider on top of it.
 #
